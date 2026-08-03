@@ -34,6 +34,34 @@ class SafetyMonitor:
         self._stop = asyncio.Event()
         self._cycle_lock = asyncio.Lock()
 
+    async def _obstruction_snapshot(self, parsed):
+        labels = {label.replace(" ", "").lower() for label in parsed.behaviors}
+        if parsed.media or not parsed.vehicle_id or not (
+            labels & {"obstructedcamera", "cameraobstruction"}
+        ):
+            return parsed
+        key = f"safety_snapshot_requested:{parsed.samsara_event_id}"
+        async with self.sessions.begin() as session:
+            if await state_get(session, key):
+                return parsed
+            await state_set(session, key, datetime.now(UTC).isoformat())
+        try:
+            media = await self.client.retrieve_camera_snapshots(
+                parsed.vehicle_id, parsed.event_timestamp
+            )
+        except Exception:
+            logger.exception(
+                "safety_snapshot_retrieval_failed event_id=%s",
+                parsed.samsara_event_id,
+            )
+            return parsed
+        logger.info(
+            "safety_snapshot_retrieved event_id=%s media_urls=%d",
+            parsed.samsara_event_id,
+            len(media),
+        )
+        return replace(parsed, media=media) if media else parsed
+
     async def poll_once(self) -> dict[str, int]:
         totals = {"pages": 0, "records": 0, "created": 0, "updated": 0}
         async with self._cycle_lock:
@@ -75,6 +103,7 @@ class SafetyMonitor:
                         parsed = parse_safety_event(raw)
                         if not parsed:
                             continue
+                        parsed = await self._obstruction_snapshot(parsed)
                         media_urls += sum(
                             1 for item in parsed.media if item.get("url")
                         )

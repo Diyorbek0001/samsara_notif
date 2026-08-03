@@ -76,7 +76,11 @@ def _safe_media(value: Any) -> list[dict[str, Any]]:
         url = item.get("url")
         if url and urlparse(str(url)).scheme != "https":
             url = None
-        result.append({"input": str(item.get("input") or "unknown"), "url": str(url) if url else None})
+        result.append({
+            "input": str(item.get("input") or "unknown"),
+            "url": str(url) if url else None,
+            "mediaType": str(item.get("mediaType") or item.get("type") or "video"),
+        })
     return result
 
 

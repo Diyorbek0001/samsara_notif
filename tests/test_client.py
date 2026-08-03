@@ -45,3 +45,23 @@ async def test_429_honors_retry_after_at_limit():
     await client.close()
     assert error.value.retry_after == 7
 
+
+def test_media_urls_extracts_and_deduplicates_snapshots():
+    payload = {
+        "data": {
+            "media": [
+                {
+                    "input": "dashcamDriverFacing",
+                    "url": "https://example.invalid/snapshot.jpg",
+                },
+                {"url": "https://example.invalid/snapshot.jpg"},
+            ]
+        }
+    }
+    assert SamsaraClient._media_urls(payload) == [
+        {
+            "input": "dashcamDriverFacing",
+            "url": "https://example.invalid/snapshot.jpg",
+            "mediaType": "image",
+        }
+    ]

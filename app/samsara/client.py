@@ -4,6 +4,7 @@ import asyncio
 import json
 import logging
 import random
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -83,6 +84,99 @@ class SamsaraClient:
                 raise SamsaraResponseError("Samsara response root is not an object")
             return payload
         raise SamsaraRequestError("Samsara request exhausted retries")
+
+    async def _post(self, path: str, payload: dict[str, Any]) -> dict[str, Any]:
+        try:
+            response = await self._client.post(path, json=payload)
+        except (httpx.TimeoutException, httpx.NetworkError) as exc:
+            raise SamsaraRequestError(
+                f"Samsara network request failed: {type(exc).__name__}"
+            ) from exc
+        if response.status_code == 401:
+            raise SamsaraAuthenticationError("Samsara API authentication failed")
+        if response.status_code == 403:
+            raise SamsaraPermissionError(
+                "Samsara API token lacks media retrieval permission"
+            )
+        if response.status_code == 429:
+            raise SamsaraRateLimitError("Samsara media retrieval quota/rate limit exceeded")
+        if response.is_error:
+            raise SamsaraResponseError(
+                f"Unexpected Samsara HTTP status {response.status_code}"
+            )
+        try:
+            result = response.json()
+        except json.JSONDecodeError as exc:
+            raise SamsaraResponseError("Samsara returned invalid JSON") from exc
+        if not isinstance(result, dict):
+            raise SamsaraResponseError("Samsara response root is not an object")
+        return result
+
+    @staticmethod
+    def _find_value(value: Any, names: set[str]) -> str | None:
+        if isinstance(value, dict):
+            for key, item in value.items():
+                if key in names and isinstance(item, str) and item:
+                    return item
+            for item in value.values():
+                found = SamsaraClient._find_value(item, names)
+                if found:
+                    return found
+        elif isinstance(value, list):
+            for item in value:
+                found = SamsaraClient._find_value(item, names)
+                if found:
+                    return found
+        return None
+
+    @staticmethod
+    def _media_urls(value: Any, inherited_input: str = "snapshot") -> list[dict[str, Any]]:
+        result: list[dict[str, Any]] = []
+        if isinstance(value, dict):
+            camera_input = str(value.get("input") or value.get("cameraInput") or inherited_input)
+            for key in ("url", "downloadUrl", "mediaUrl"):
+                url = value.get(key)
+                if isinstance(url, str) and url.startswith("https://"):
+                    result.append({"input": camera_input, "url": url, "mediaType": "image"})
+            for item in value.values():
+                result.extend(SamsaraClient._media_urls(item, camera_input))
+        elif isinstance(value, list):
+            for item in value:
+                result.extend(SamsaraClient._media_urls(item, inherited_input))
+        unique: dict[str, dict[str, Any]] = {}
+        for item in result:
+            unique.setdefault(item["url"], item)
+        return list(unique.values())
+
+    async def retrieve_camera_snapshots(
+        self, vehicle_id: str, event_time: datetime
+    ) -> list[dict[str, Any]]:
+        timestamp = event_time.isoformat().replace("+00:00", "Z")
+        created = await self._post(
+            "/cameras/media/retrieval",
+            {
+                "vehicleId": vehicle_id,
+                "startTime": timestamp,
+                "endTime": timestamp,
+                "mediaType": "image",
+                "inputs": ["dashcamRoadFacing", "dashcamDriverFacing"],
+            },
+        )
+        retrieval_id = self._find_value(created, {"retrievalId", "id"})
+        if not retrieval_id:
+            raise SamsaraResponseError("Media retrieval response omitted retrieval ID")
+        for _ in range(12):
+            details = await self._get(
+                "/cameras/media/retrieval", {"retrievalId": retrieval_id}
+            )
+            media = self._media_urls(details)
+            if media:
+                return media
+            status = (self._find_value(details, {"status"}) or "").lower()
+            if status in {"failed", "unavailable", "cancelled", "canceled"}:
+                return []
+            await asyncio.sleep(5)
+        return []
 
     async def get_fault_code_feed(self, after: str | None = None) -> FeedPage:
         params: dict[str, Any] = {"types": "faultCodes"}
@@ -172,3 +266,8 @@ class MockSamsaraClient:
         query_by_time_field: str = "updatedAtTime",
     ) -> SafetyStreamPage:
         return SafetyStreamPage([], "mock-safety-cursor", False)
+
+    async def retrieve_camera_snapshots(
+        self, vehicle_id: str, event_time: datetime
+    ) -> list[dict[str, Any]]:
+        return []

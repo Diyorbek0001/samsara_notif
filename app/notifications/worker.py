@@ -5,7 +5,7 @@ import logging
 from datetime import UTC, datetime, timedelta
 
 from aiogram import Bot
-from aiogram.types import InputMediaVideo
+from aiogram.types import InputMediaPhoto, InputMediaVideo
 from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from sqlalchemy.orm import selectinload
@@ -101,20 +101,31 @@ class OutboxWorker:
                     safety_chat_id = route.chat_id
                     safety_topic_id = route.thread_id
                     valid_media = [
-                        media["url"] for media in safety_event.media_json
+                        media for media in safety_event.media_json
                         if isinstance(media, dict) and media.get("url")
                     ]
                     message = None
                     if len(valid_media) == 1:
                         try:
-                            message = await self.bot.send_video(
-                                chat_id=safety_chat_id,
-                                message_thread_id=safety_topic_id,
-                                video=valid_media[0],
-                                caption=text,
-                                parse_mode="HTML",
-                                reply_markup=None,
-                            )
+                            media_item = valid_media[0]
+                            if str(media_item.get("mediaType", "video")).lower() == "image":
+                                message = await self.bot.send_photo(
+                                    chat_id=safety_chat_id,
+                                    message_thread_id=safety_topic_id,
+                                    photo=media_item["url"],
+                                    caption=text,
+                                    parse_mode="HTML",
+                                    reply_markup=None,
+                                )
+                            else:
+                                message = await self.bot.send_video(
+                                    chat_id=safety_chat_id,
+                                    message_thread_id=safety_topic_id,
+                                    video=media_item["url"],
+                                    caption=text,
+                                    parse_mode="HTML",
+                                    reply_markup=None,
+                                )
                         except Exception:
                             logger.warning("safety_media_send_failed alert_id=%s", safety_event.alert_id)
                     elif len(valid_media) > 1:
@@ -123,12 +134,12 @@ class OutboxWorker:
                                 chat_id=safety_chat_id,
                                 message_thread_id=safety_topic_id,
                                 media=[
-                                    InputMediaVideo(
-                                        media=url,
+                                    (InputMediaPhoto if str(item.get("mediaType", "video")).lower() == "image" else InputMediaVideo)(
+                                        media=item["url"],
                                         caption=text if index == 0 else None,
                                         parse_mode="HTML" if index == 0 else None,
                                     )
-                                    for index, url in enumerate(valid_media[:10])
+                                    for index, item in enumerate(valid_media[:10])
                                 ],
                             )
                             message = messages[0]

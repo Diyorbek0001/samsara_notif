@@ -70,3 +70,22 @@ def test_structured_address_is_formatted_for_notification():
     )
     assert event is not None
     assert event.location_name == "2123 Harrison Drive, Clinton, IA 52730, US"
+
+
+def test_snapshot_media_type_is_preserved():
+    event = parse_safety_event(
+        {
+            "id": "event-snapshot",
+            "startMs": "2026-08-03T18:30:00Z",
+            "behaviorLabels": [{"label": "ObstructedCamera"}],
+            "media": [
+                {
+                    "input": "dashcamDriverFacing",
+                    "url": "https://example.invalid/snapshot.jpg",
+                    "mediaType": "image",
+                }
+            ],
+        }
+    )
+    assert event is not None
+    assert event.media[0]["mediaType"] == "image"
