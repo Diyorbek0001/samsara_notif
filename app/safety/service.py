@@ -129,18 +129,28 @@ async def process_safety_event(
     vehicle = await _vehicle(session, event)
     driver = await _driver(session, event)
     if existing:
+        previous_speed_details = (
+            existing.raw_event_json.get("speedingDetails")
+            if isinstance(existing.raw_event_json, dict)
+            else None
+        )
         if (
             "speedingDetails" not in safe_raw
             and isinstance(existing.raw_event_json, dict)
             and existing.raw_event_json.get("speedingDetails")
         ):
             safe_raw["speedingDetails"] = existing.raw_event_json["speedingDetails"]
+        speed_details_changed = (
+            safe_raw.get("speedingDetails") is not None
+            and safe_raw.get("speedingDetails") != previous_speed_details
+        )
         previous_media_signature = media_signature(existing.media_json)
         new_media_signature = media_signature(event.media)
         changed = (
             existing.event_state != event.event_state
             or existing.behavior_labels_json != event.behaviors
             or existing.media_json != event.media
+            or speed_details_changed
         )
         existing.vehicle_id = vehicle.id if vehicle else existing.vehicle_id
         existing.driver_id = driver.id if driver else existing.driver_id
@@ -172,6 +182,29 @@ async def process_safety_event(
                     notification_type="media_update",
                     idempotency_key=(
                         f"safety:media:{event.samsara_event_id}:{new_media_signature}"
+                    ),
+                    payload_json={
+                        "safety_event_id": existing.id,
+                        "alert_id": existing.alert_id,
+                        "integration_id": integration_id,
+                    },
+                    status="pending",
+                    attempt_count=0,
+                    next_attempt_at=now,
+                    created_at=now,
+                )
+            )
+        if speed_details_changed:
+            speed_signature = hashlib.sha256(
+                str(safe_raw["speedingDetails"]).encode()
+            ).hexdigest()[:20]
+            session.add(
+                NotificationOutbox(
+                    safety_event_id=existing.id,
+                    category="safety",
+                    notification_type="speed_update",
+                    idempotency_key=(
+                        f"safety:speed:{event.samsara_event_id}:{speed_signature}"
                     ),
                     payload_json={
                         "safety_event_id": existing.id,
