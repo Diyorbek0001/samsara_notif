@@ -129,6 +129,12 @@ async def process_safety_event(
     vehicle = await _vehicle(session, event)
     driver = await _driver(session, event)
     if existing:
+        if (
+            "speedingDetails" not in safe_raw
+            and isinstance(existing.raw_event_json, dict)
+            and existing.raw_event_json.get("speedingDetails")
+        ):
+            safe_raw["speedingDetails"] = existing.raw_event_json["speedingDetails"]
         previous_media_signature = media_signature(existing.media_json)
         new_media_signature = media_signature(event.media)
         changed = (

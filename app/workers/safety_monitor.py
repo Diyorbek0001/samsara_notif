@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import json
 import logging
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
@@ -62,6 +63,54 @@ class SafetyMonitor:
         )
         return replace(parsed, media=media) if media else parsed
 
+    async def _speed_enrichment(self, parsed):
+        labels = {label.replace(" ", "").lower() for label in parsed.behaviors}
+        if not parsed.vehicle_id or not any("speed" in label for label in labels):
+            return parsed
+        key = f"safety_speed_details:{parsed.samsara_event_id}"
+        async with self.sessions() as session:
+            cached = await state_get(session, key)
+        details = None
+        if cached:
+            try:
+                stored = json.loads(cached)
+                if isinstance(stored, dict) and stored.get("details"):
+                    details = stored["details"]
+                elif isinstance(stored, dict) and stored.get("checkedAt"):
+                    checked = datetime.fromisoformat(stored["checkedAt"])
+                    if datetime.now(UTC) - checked < timedelta(minutes=5):
+                        return parsed
+            except (ValueError, TypeError):
+                pass
+        if details is None:
+            try:
+                details = await self.client.get_speeding_details(
+                    parsed.vehicle_id, parsed.event_timestamp
+                )
+            except Exception:
+                logger.exception(
+                    "safety_speed_enrichment_failed event_id=%s",
+                    parsed.samsara_event_id,
+                )
+                async with self.sessions.begin() as session:
+                    await state_set(
+                        session,
+                        key,
+                        json.dumps({"checkedAt": datetime.now(UTC).isoformat()}),
+                    )
+                return parsed
+            stored = {
+                "checkedAt": datetime.now(UTC).isoformat(),
+                "details": details,
+            }
+            async with self.sessions.begin() as session:
+                await state_set(session, key, json.dumps(stored))
+        if not details:
+            return parsed
+        raw = dict(parsed.raw)
+        raw["speedingDetails"] = details
+        return replace(parsed, raw=raw)
+
     async def poll_once(self) -> dict[str, int]:
         totals = {"pages": 0, "records": 0, "created": 0, "updated": 0}
         async with self._cycle_lock:
@@ -104,6 +153,7 @@ class SafetyMonitor:
                         if not parsed:
                             continue
                         parsed = await self._obstruction_snapshot(parsed)
+                        parsed = await self._speed_enrichment(parsed)
                         media_urls += sum(
                             1 for item in parsed.media if item.get("url")
                         )

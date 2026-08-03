@@ -4,7 +4,7 @@ import asyncio
 import json
 import logging
 import random
-from datetime import datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -178,6 +178,90 @@ class SamsaraClient:
             await asyncio.sleep(5)
         return []
 
+    async def get_speeding_details(
+        self, vehicle_id: str, event_time: datetime
+    ) -> dict[str, Any] | None:
+        start = (event_time - timedelta(hours=2)).astimezone(UTC)
+        end = (event_time + timedelta(hours=2)).astimezone(UTC)
+        now = datetime.now(UTC)
+        if end > now:
+            end = now
+        params = {
+            "assetIds": vehicle_id,
+            "startTime": start.isoformat().replace("+00:00", "Z"),
+            "endTime": end.isoformat().replace("+00:00", "Z"),
+            "queryBy": "tripStartTime",
+        }
+        payload = await self._get("/speeding-intervals/stream", params)
+        candidates: list[tuple[float, dict[str, Any]]] = []
+        for trip in payload.get("data", []):
+            if not isinstance(trip, dict):
+                continue
+            for interval in trip.get("intervals", []):
+                if not isinstance(interval, dict):
+                    continue
+                try:
+                    interval_start = datetime.fromisoformat(
+                        str(interval.get("startTime", "")).replace("Z", "+00:00")
+                    )
+                    interval_end = datetime.fromisoformat(
+                        str(interval.get("endTime", "")).replace("Z", "+00:00")
+                    )
+                except ValueError:
+                    continue
+                distance = 0.0 if interval_start <= event_time <= interval_end else min(
+                    abs((event_time - interval_start).total_seconds()),
+                    abs((event_time - interval_end).total_seconds()),
+                )
+                if distance <= 300:
+                    candidates.append((distance, interval))
+        if candidates:
+            interval = min(candidates, key=lambda item: item[0])[1]
+            maximum_kph = interval.get("maxSpeedKilometersPerHour")
+            limit_kph = interval.get("postedSpeedLimitKilometersPerHour")
+            maximum_mph = float(maximum_kph) * 0.621371 if maximum_kph is not None else None
+            limit_mph = float(limit_kph) * 0.621371 if limit_kph is not None else None
+            try:
+                started = datetime.fromisoformat(str(interval["startTime"]).replace("Z", "+00:00"))
+                ended = datetime.fromisoformat(str(interval["endTime"]).replace("Z", "+00:00"))
+                duration = max(0, round((ended - started).total_seconds()))
+            except (KeyError, ValueError):
+                duration = None
+            return {
+                "maxSpeedMph": maximum_mph,
+                "postedSpeedLimitMph": limit_mph,
+                "overLimitMph": maximum_mph - limit_mph
+                if maximum_mph is not None and limit_mph is not None else None,
+                "durationSeconds": duration,
+                "severityLevel": interval.get("severityLevel"),
+                "source": "speedingIntervals",
+            }
+
+        history_start = (event_time - timedelta(seconds=45)).isoformat().replace("+00:00", "Z")
+        history_end = (event_time + timedelta(seconds=45)).isoformat().replace("+00:00", "Z")
+        history = await self._get(
+            "/fleet/vehicles/stats/history",
+            {
+                "vehicleIds": vehicle_id,
+                "types": "ecuSpeedMph",
+                "startTime": history_start,
+                "endTime": history_end,
+            },
+        )
+        readings: list[float] = []
+        for vehicle in history.get("data", []):
+            if not isinstance(vehicle, dict):
+                continue
+            for reading in vehicle.get("ecuSpeedMph", []):
+                if isinstance(reading, dict) and reading.get("value") is not None:
+                    try:
+                        readings.append(float(reading["value"]))
+                    except (TypeError, ValueError):
+                        pass
+        if readings:
+            return {"maxSpeedMph": max(readings), "source": "vehicleSpeedHistory"}
+        return None
+
     async def get_fault_code_feed(self, after: str | None = None) -> FeedPage:
         params: dict[str, Any] = {"types": "faultCodes"}
         if after:
@@ -271,3 +355,8 @@ class MockSamsaraClient:
         self, vehicle_id: str, event_time: datetime
     ) -> list[dict[str, Any]]:
         return []
+
+    async def get_speeding_details(
+        self, vehicle_id: str, event_time: datetime
+    ) -> dict[str, Any] | None:
+        return None

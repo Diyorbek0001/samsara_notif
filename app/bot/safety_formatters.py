@@ -40,6 +40,22 @@ def safety_message(event: SafetyEvent, timezone: str, test: bool = False) -> str
     if event.latitude is not None and event.longitude is not None:
         maps = f"https://www.google.com/maps/search/?api=1&amp;query={event.latitude:.6f},{event.longitude:.6f}"
         lines.append(f'🗺 <a href="{maps}">Google Maps</a>')
+    speed = (
+        event.raw_event_json.get("speedingDetails")
+        if isinstance(event.raw_event_json, dict)
+        else None
+    )
+    if isinstance(speed, dict) and speed.get("maxSpeedMph") is not None:
+        maximum = round(float(speed["maxSpeedMph"]))
+        lines.append(f"🚛 <b>Maximum speed:</b> {maximum} mph")
+        if speed.get("postedSpeedLimitMph") is not None:
+            limit = round(float(speed["postedSpeedLimitMph"]))
+            lines.append(f"🚦 <b>Posted limit:</b> {limit} mph")
+        if speed.get("overLimitMph") is not None:
+            over = round(float(speed["overLimitMph"]))
+            lines.append(f"⚡ <b>Over limit:</b> {over} mph")
+        if speed.get("durationSeconds") is not None:
+            lines.append(f"⏱ <b>Duration:</b> {int(speed['durationSeconds'])} seconds")
     lines.extend(
         [
             "",
@@ -48,4 +64,3 @@ def safety_message(event: SafetyEvent, timezone: str, test: bool = False) -> str
         ]
     )
     return "\n".join(lines)
-

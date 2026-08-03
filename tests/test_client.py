@@ -1,3 +1,5 @@
+from datetime import UTC, datetime
+
 import httpx
 import pytest
 
@@ -65,3 +67,40 @@ def test_media_urls_extracts_and_deduplicates_snapshots():
             "mediaType": "image",
         }
     ]
+
+
+@pytest.mark.asyncio
+async def test_speeding_details_matches_event_interval_and_converts_to_mph():
+    async def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.path == "/speeding-intervals/stream"
+        return httpx.Response(
+            200,
+            json={
+                "data": [
+                    {
+                        "intervals": [
+                            {
+                                "startTime": "2026-08-03T18:59:00Z",
+                                "endTime": "2026-08-03T19:00:00Z",
+                                "maxSpeedKilometersPerHour": 128.747,
+                                "postedSpeedLimitKilometersPerHour": 104.607,
+                                "severityLevel": "severe",
+                            }
+                        ]
+                    }
+                ]
+            },
+        )
+
+    client = SamsaraClient(
+        "secret", "https://api.samsara.com", transport=httpx.MockTransport(handler)
+    )
+    details = await client.get_speeding_details(
+        "vehicle-1", datetime(2026, 8, 3, 18, 59, 30, tzinfo=UTC)
+    )
+    await client.close()
+    assert details is not None
+    assert round(details["maxSpeedMph"]) == 80
+    assert round(details["postedSpeedLimitMph"]) == 65
+    assert round(details["overLimitMph"]) == 15
+    assert details["durationSeconds"] == 60
