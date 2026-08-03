@@ -61,17 +61,23 @@ class SafetyMonitor:
             # each cycle from the last successful time makes downtime recoverable.
             after = None
             while True:
+                media_urls = 0
                 page = await self.client.get_safety_event_stream(
                     start_time=start,
                     end_time=end,
                     after=after,
-                    query_by_time_field="createdAtTime",
+                    # Samsara often attaches camera media after first creating the
+                    # safety event. Poll updates so those later URLs are delivered.
+                    query_by_time_field="updatedAtTime",
                 )
                 async with self.sessions.begin() as session:
                     for raw in page.data:
                         parsed = parse_safety_event(raw)
                         if not parsed:
                             continue
+                        media_urls += sum(
+                            1 for item in parsed.media if item.get("url")
+                        )
                         if self.integration_id:
                             parsed = replace(
                                 parsed,
@@ -102,11 +108,15 @@ class SafetyMonitor:
                     await state_set(session, LAST_SUCCESS_KEY + suffix, cycle_end.isoformat())
                 totals["pages"] += 1
                 logger.info(
-                    "safety_cursor_committed cursor_hash=%s page=%d raw_records=%d records=%d",
+                    "safety_cursor_committed cursor_hash=%s page=%d raw_records=%d "
+                    "records=%d created=%d updated=%d media_urls=%d",
                     hashlib.sha256(page.end_cursor.encode()).hexdigest()[:10],
                     totals["pages"],
                     len(page.data),
                     totals["records"],
+                    totals["created"],
+                    totals["updated"],
+                    media_urls,
                 )
                 after = page.end_cursor
                 initialization = False
