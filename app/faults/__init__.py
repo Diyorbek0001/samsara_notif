@@ -1,0 +1,2 @@
+"""Fault incident domain."""
+

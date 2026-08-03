@@ -1,0 +1,1 @@
+SAFETY_PRIVATE_CHAT_KEY = "telegram_safety_private_chat_id"

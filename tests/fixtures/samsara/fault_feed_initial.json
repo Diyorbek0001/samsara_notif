@@ -1,0 +1,28 @@
+{
+  "data": [
+    {
+      "id": "mock-vehicle-445082",
+      "name": "445082",
+      "faultCodes": [
+        {
+          "time": "2026-07-24T14:42:00Z",
+          "j1939": {"spn": 4364, "fmi": 18},
+          "occurrenceCount": 3,
+          "warningLamp": "On",
+          "active": true,
+          "description": "Mock aftertreatment diagnostic fault."
+        },
+        {
+          "time": "2026-07-24T14:42:00Z",
+          "obdii": {"code": "P0420"},
+          "active": true
+        }
+      ]
+    }
+  ],
+  "pagination": {
+    "endCursor": "mock-cursor-initial",
+    "hasNextPage": false
+  }
+}
+

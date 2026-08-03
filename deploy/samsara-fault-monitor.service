@@ -1,0 +1,19 @@
+[Unit]
+Description=Samsara Telegram Fault Monitor
+After=network-online.target
+
+[Service]
+Type=simple
+User=samsara-monitor
+Group=samsara-monitor
+WorkingDirectory=/opt/samsara-fault-monitor
+EnvironmentFile=/etc/samsara-fault-monitor.env
+ExecStart=/opt/samsara-fault-monitor/.venv/bin/python -m app.main run
+Restart=on-failure
+RestartSec=10
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target
+

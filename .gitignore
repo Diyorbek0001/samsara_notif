@@ -1,0 +1,16 @@
+.env
+.venv/
+__pycache__/
+*.py[cod]
+*.db
+*.db.backup*
+*.sqlite*
+.pytest_cache/
+.coverage
+htmlcov/
+logs/
+storage/media/
+.*.lock
+.DS_Store
+*.egg-info/
+run_bot_forever.sh
