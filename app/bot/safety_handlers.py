@@ -11,10 +11,8 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from sqlalchemy.orm import selectinload
 
 from app.bot.safety_formatters import safety_message
-from app.bot.routing import SAFETY_PRIVATE_CHAT_KEY
 from app.config import Settings
-from app.database.models import NotificationOutbox, SafetyEvent, SafetyEventUpdate
-from app.faults.service import state_get, state_set
+from app.database.models import SafetyEvent, SafetyEventUpdate
 
 
 def build_safety_router(
@@ -36,62 +34,17 @@ def build_safety_router(
             )
 
     @router.message(Command("start"))
-    async def start_private_alerts(message: Message) -> None:
+    async def start_admin_console(message: Message) -> None:
         if message.chat.type != "private":
             await message.answer("Please send /start to me in a private chat.")
             return
-        queued = 0
-        async with sessions.begin() as session:
-            existing = await state_get(session, SAFETY_PRIVATE_CHAT_KEY)
-            if existing and existing != str(message.chat.id) and not authorized(message.from_user):
-                await message.answer("A private safety-alert chat is already registered.")
-                return
-            if not existing and (settings.authorized_ids or settings.authorized_usernames) and not authorized(message.from_user):
-                await message.answer("Not authorized.")
-                return
-            await state_set(session, SAFETY_PRIVATE_CHAT_KEY, str(message.chat.id))
-            recent = list(
-                (
-                    await session.scalars(
-                        select(SafetyEvent)
-                        .order_by(SafetyEvent.event_timestamp.desc())
-                        .limit(20)
-                    )
-                ).all()
-            )
-            now = datetime.now(UTC)
-            for event in recent:
-                idempotency_key = (
-                    f"safety:private:{message.chat.id}:{event.samsara_event_id}"
-                )
-                already_queued = await session.scalar(
-                    select(NotificationOutbox.id).where(
-                        NotificationOutbox.idempotency_key == idempotency_key
-                    )
-                )
-                if already_queued:
-                    continue
-                session.add(
-                    NotificationOutbox(
-                        safety_event_id=event.id,
-                        category="safety",
-                        notification_type="private_replay",
-                        idempotency_key=idempotency_key,
-                        payload_json={
-                            "safety_event_id": event.id,
-                            "alert_id": event.alert_id,
-                        },
-                        status="pending",
-                        attempt_count=0,
-                        next_attempt_at=now,
-                        created_at=now,
-                    )
-                )
-                queued += 1
+        if not authorized(message.from_user):
+            await message.answer("Not authorized.")
+            return
         await message.answer(
-            "Safety alerts and dashcam videos will be sent to this private chat. "
-            "Truck-fault notifications will continue going to the fleet group. "
-            f"Queued {queued} recent safety alert(s) for testing."
+            "Admin console ready. This private chat is only for configuration and "
+            "admin commands. Notifications are sent only to groups or group topics "
+            "configured with /activate. Send /help to see the available commands."
         )
 
     @router.message(Command("safety_today", "safety_active"))

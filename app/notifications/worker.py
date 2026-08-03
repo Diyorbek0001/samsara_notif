@@ -11,11 +11,9 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from sqlalchemy.orm import selectinload
 
 from app.bot.formatters import cleared_message, fault_message
-from app.bot.routing import SAFETY_PRIVATE_CHAT_KEY
 from app.bot.safety_formatters import safety_message
 from app.config import Settings
 from app.database.models import FaultIncident, NotificationLog, NotificationOutbox, SafetyEvent, TelegramRoute
-from app.faults.service import state_get
 
 logger = logging.getLogger(__name__)
 
@@ -84,28 +82,24 @@ class OutboxWorker:
                     .options(selectinload(SafetyEvent.vehicle), selectinload(SafetyEvent.driver))
                     .where(SafetyEvent.id == item.safety_event_id)
                 ) if item.category == "safety" else None
-                safety_private_chat = (
-                    await state_get(session, SAFETY_PRIVATE_CHAT_KEY)
-                    if item.category == "safety"
-                    else None
-                )
             if item.category == "fault" and not incident:
                 await self._fail(item_id, "Incident no longer exists", dead=True)
                 continue
             if item.category == "safety" and not safety_event:
                 await self._fail(item_id, "Safety event no longer exists", dead=True)
                 continue
+            if route is None:
+                await self._fail(
+                    item_id,
+                    "No active Telegram group/thread route for this notification",
+                    dead=True,
+                )
+                continue
             try:
                 if item.category == "safety":
                     text = safety_message(safety_event, self.settings.timezone)
-                    safety_chat_id = (
-                        route.chat_id if route else int(safety_private_chat)
-                        if safety_private_chat else self.settings.group_id
-                    )
-                    safety_topic_id = (
-                        route.thread_id if route else None if safety_private_chat
-                        else self.settings.telegram_safety_topic_id
-                    )
+                    safety_chat_id = route.chat_id
+                    safety_topic_id = route.thread_id
                     valid_media = [
                         media["url"] for media in safety_event.media_json
                         if isinstance(media, dict) and media.get("url")
@@ -155,8 +149,8 @@ class OutboxWorker:
                         else fault_message(incident, self.settings.timezone)
                     )
                     reply_to = incident.telegram_message_id if item.notification_type == "cleared" else None
-                    fault_chat_id = route.chat_id if route else self.settings.group_id
-                    fault_topic_id = route.thread_id if route else self.settings.telegram_fault_topic_id
+                    fault_chat_id = route.chat_id
+                    fault_topic_id = route.thread_id
                     message = await self.bot.send_message(
                         chat_id=fault_chat_id,
                         message_thread_id=fault_topic_id,
