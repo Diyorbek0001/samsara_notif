@@ -120,6 +120,7 @@ async def process_safety_event(
     send_initial: bool,
     timezone: str,
     integration_id: int | None = None,
+    notification_delay_seconds: int = 90,
 ) -> tuple[SafetyEvent, str]:
     existing = await session.scalar(
         select(SafetyEvent).where(SafetyEvent.samsara_event_id == event.samsara_event_id)
@@ -175,48 +176,64 @@ async def process_safety_event(
                 )
             )
         if new_media_signature and new_media_signature != previous_media_signature:
-            session.add(
-                NotificationOutbox(
-                    safety_event_id=existing.id,
-                    category="safety",
-                    notification_type="media_update",
-                    idempotency_key=(
-                        f"safety:media:{event.samsara_event_id}:{new_media_signature}"
-                    ),
-                    payload_json={
-                        "safety_event_id": existing.id,
-                        "alert_id": existing.alert_id,
-                        "integration_id": integration_id,
-                    },
-                    status="pending",
-                    attempt_count=0,
-                    next_attempt_at=now,
-                    created_at=now,
+            unsent_initial = await session.scalar(
+                select(NotificationOutbox.id).where(
+                    NotificationOutbox.safety_event_id == existing.id,
+                    NotificationOutbox.notification_type == "new",
+                    NotificationOutbox.status.in_(("pending", "failed", "processing")),
                 )
             )
+            if unsent_initial is None:
+                session.add(
+                    NotificationOutbox(
+                        safety_event_id=existing.id,
+                        category="safety",
+                        notification_type="media_update",
+                        idempotency_key=(
+                            f"safety:media:{event.samsara_event_id}:{new_media_signature}"
+                        ),
+                        payload_json={
+                            "safety_event_id": existing.id,
+                            "alert_id": existing.alert_id,
+                            "integration_id": integration_id,
+                        },
+                        status="pending",
+                        attempt_count=0,
+                        next_attempt_at=now,
+                        created_at=now,
+                    )
+                )
         if speed_details_changed:
-            speed_signature = hashlib.sha256(
-                str(safe_raw["speedingDetails"]).encode()
-            ).hexdigest()[:20]
-            session.add(
-                NotificationOutbox(
-                    safety_event_id=existing.id,
-                    category="safety",
-                    notification_type="speed_update",
-                    idempotency_key=(
-                        f"safety:speed:{event.samsara_event_id}:{speed_signature}"
-                    ),
-                    payload_json={
-                        "safety_event_id": existing.id,
-                        "alert_id": existing.alert_id,
-                        "integration_id": integration_id,
-                    },
-                    status="pending",
-                    attempt_count=0,
-                    next_attempt_at=now,
-                    created_at=now,
+            unsent_initial = await session.scalar(
+                select(NotificationOutbox.id).where(
+                    NotificationOutbox.safety_event_id == existing.id,
+                    NotificationOutbox.notification_type == "new",
+                    NotificationOutbox.status.in_(("pending", "failed", "processing")),
                 )
             )
+            if unsent_initial is None:
+                speed_signature = hashlib.sha256(
+                    str(safe_raw["speedingDetails"]).encode()
+                ).hexdigest()[:20]
+                session.add(
+                    NotificationOutbox(
+                        safety_event_id=existing.id,
+                        category="safety",
+                        notification_type="speed_update",
+                        idempotency_key=(
+                            f"safety:speed:{event.samsara_event_id}:{speed_signature}"
+                        ),
+                        payload_json={
+                            "safety_event_id": existing.id,
+                            "alert_id": existing.alert_id,
+                            "integration_id": integration_id,
+                        },
+                        status="pending",
+                        attempt_count=0,
+                        next_attempt_at=now,
+                        created_at=now,
+                    )
+                )
         return existing, "updated" if changed else "unchanged"
 
     row = SafetyEvent(
@@ -263,7 +280,7 @@ async def process_safety_event(
                 payload_json={"safety_event_id": row.id, "alert_id": row.alert_id, "integration_id": integration_id},
                 status="pending",
                 attempt_count=0,
-                next_attempt_at=now,
+                next_attempt_at=now + timedelta(seconds=notification_delay_seconds),
                 created_at=now,
             )
         )

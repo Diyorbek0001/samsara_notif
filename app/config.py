@@ -27,6 +27,7 @@ class Settings(BaseSettings):
     samsara_base_url: str = "https://api.samsara.com"
     samsara_fault_poll_seconds: int = Field(30, ge=5)
     safety_poll_seconds: int = Field(15, ge=5)
+    safety_notification_delay_seconds: int = Field(90, ge=0, le=600)
     samsara_request_timeout_seconds: float = Field(30, gt=0)
     samsara_max_retries: int = Field(5, ge=1, le=10)
     timezone: str = "America/New_York"

@@ -178,6 +178,9 @@ class SafetyMonitor:
                             send_initial=self.settings.send_initial_safety_events,
                             timezone=self.settings.timezone,
                             integration_id=self.integration_id,
+                            notification_delay_seconds=(
+                                self.settings.safety_notification_delay_seconds
+                            ),
                         )
                         totals["records"] += 1
                         if result in totals:

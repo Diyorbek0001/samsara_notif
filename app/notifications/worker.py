@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import logging
 from datetime import UTC, datetime, timedelta
+from html import escape
 
 from aiogram import Bot
 from aiogram.types import InputMediaPhoto, InputMediaVideo
@@ -97,7 +98,14 @@ class OutboxWorker:
                 continue
             try:
                 if item.category == "safety":
-                    text = safety_message(safety_event, self.settings.timezone)
+                    text = (
+                        "📹 <b>Camera media update</b>\n"
+                        f"<b>Alert ID:</b> {escape(safety_event.alert_id)}\n"
+                        f"<b>Vehicle:</b> "
+                        f"{escape(safety_event.vehicle.vehicle_name if safety_event.vehicle and safety_event.vehicle.vehicle_name else 'Unknown')}"
+                        if item.notification_type == "media_update"
+                        else safety_message(safety_event, self.settings.timezone)
+                    )
                     safety_chat_id = route.chat_id
                     safety_topic_id = route.thread_id
                     valid_media = [
