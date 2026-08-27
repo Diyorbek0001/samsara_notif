@@ -111,6 +111,34 @@ class SafetyMonitor:
         raw["speedingDetails"] = details
         return replace(parsed, raw=raw)
 
+    async def _speed_video(self, parsed):
+        labels = {label.replace(" ", "").lower() for label in parsed.behaviors}
+        if parsed.media or not parsed.vehicle_id or not any(
+            "speed" in label for label in labels
+        ):
+            return parsed
+        key = f"safety_speed_video_requested:{parsed.samsara_event_id}"
+        async with self.sessions.begin() as session:
+            if await state_get(session, key):
+                return parsed
+            await state_set(session, key, datetime.now(UTC).isoformat())
+        try:
+            media = await self.client.retrieve_camera_video(
+                parsed.vehicle_id, parsed.event_timestamp
+            )
+        except Exception:
+            logger.exception(
+                "safety_speed_video_retrieval_failed event_id=%s",
+                parsed.samsara_event_id,
+            )
+            return parsed
+        logger.info(
+            "safety_speed_video_retrieved event_id=%s media_urls=%d",
+            parsed.samsara_event_id,
+            len(media),
+        )
+        return replace(parsed, media=media) if media else parsed
+
     async def poll_once(self) -> dict[str, int]:
         totals = {"pages": 0, "records": 0, "created": 0, "updated": 0}
         async with self._cycle_lock:
@@ -154,6 +182,7 @@ class SafetyMonitor:
                             continue
                         parsed = await self._obstruction_snapshot(parsed)
                         parsed = await self._speed_enrichment(parsed)
+                        parsed = await self._speed_video(parsed)
                         media_urls += sum(
                             1 for item in parsed.media if item.get("url")
                         )

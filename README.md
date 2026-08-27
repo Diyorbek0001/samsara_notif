@@ -23,6 +23,8 @@ maintenance workflow status are deliberately separate.
 - **Read Vehicles** for full VIN/make/model/license metadata
 - **Read Safety Events & Scores** for safety alerts
 - **Read Camera Media** for safety-event video
+- **Read Media Retrieval** and **Write Media Retrieval** to request dashcam
+  footage around speeding alerts
 - Telegram bot that can send messages in the destination group/topic
 - PostgreSQL for production; SQLite is suitable for one local process
 
@@ -160,6 +162,13 @@ controls. New events are deduplicated by Samsara event ID and receive
 lookback, saves its cursor, and suppresses historical alerts by default. When
 Samsara provides a usable media URL, the sender attempts video delivery and falls
 back to the complete text alert if Telegram cannot retrieve it.
+
+Speeding alerts do not include dashcam video in the alert webhook itself. When a
+speeding safety event has no attached media, the monitor requests a 20-second
+high-resolution clip (10 seconds before through 10 seconds after the event) from
+both road-facing and driver-facing cameras. The dashcam must have been installed,
+recording, and able to upload the requested interval; offline devices may not make
+the clip available before the initial notification is sent.
 
 Camera footage is sensitive. Restrict the Telegram group, Samsara token, database,
 and temporary storage to authorized staff. Signed camera URLs must never be

@@ -130,19 +130,29 @@ class SamsaraClient:
         return None
 
     @staticmethod
-    def _media_urls(value: Any, inherited_input: str = "snapshot") -> list[dict[str, Any]]:
+    def _media_urls(
+        value: Any,
+        inherited_input: str = "snapshot",
+        inherited_media_type: str = "image",
+    ) -> list[dict[str, Any]]:
         result: list[dict[str, Any]] = []
         if isinstance(value, dict):
             camera_input = str(value.get("input") or value.get("cameraInput") or inherited_input)
+            media_type = str(value.get("mediaType") or value.get("type") or inherited_media_type)
             for key in ("url", "downloadUrl", "mediaUrl"):
                 url = value.get(key)
                 if isinstance(url, str) and url.startswith("https://"):
-                    result.append({"input": camera_input, "url": url, "mediaType": "image"})
+                    normalized_type = "image" if media_type.lower() == "image" else "video"
+                    result.append({"input": camera_input, "url": url, "mediaType": normalized_type})
             for item in value.values():
-                result.extend(SamsaraClient._media_urls(item, camera_input))
+                result.extend(SamsaraClient._media_urls(item, camera_input, media_type))
         elif isinstance(value, list):
             for item in value:
-                result.extend(SamsaraClient._media_urls(item, inherited_input))
+                result.extend(
+                    SamsaraClient._media_urls(
+                        item, inherited_input, inherited_media_type
+                    )
+                )
         unique: dict[str, dict[str, Any]] = {}
         for item in result:
             unique.setdefault(item["url"], item)
@@ -151,14 +161,42 @@ class SamsaraClient:
     async def retrieve_camera_snapshots(
         self, vehicle_id: str, event_time: datetime
     ) -> list[dict[str, Any]]:
-        timestamp = event_time.isoformat().replace("+00:00", "Z")
+        return await self.retrieve_camera_media(
+            vehicle_id,
+            event_time,
+            event_time,
+            media_type="image",
+        )
+
+    async def retrieve_camera_video(
+        self, vehicle_id: str, event_time: datetime
+    ) -> list[dict[str, Any]]:
+        # Include context immediately before and after the detected event while
+        # keeping each API retrieval and Telegram upload reasonably small.
+        return await self.retrieve_camera_media(
+            vehicle_id,
+            event_time - timedelta(seconds=10),
+            event_time + timedelta(seconds=10),
+            media_type="videoHighRes",
+        )
+
+    async def retrieve_camera_media(
+        self,
+        vehicle_id: str,
+        start_time: datetime,
+        end_time: datetime,
+        *,
+        media_type: str,
+    ) -> list[dict[str, Any]]:
+        start = start_time.isoformat().replace("+00:00", "Z")
+        end = end_time.isoformat().replace("+00:00", "Z")
         created = await self._post(
             "/cameras/media/retrieval",
             {
                 "vehicleId": vehicle_id,
-                "startTime": timestamp,
-                "endTime": timestamp,
-                "mediaType": "image",
+                "startTime": start,
+                "endTime": end,
+                "mediaType": media_type,
                 "inputs": ["dashcamRoadFacing", "dashcamDriverFacing"],
             },
         )
@@ -352,6 +390,11 @@ class MockSamsaraClient:
         return SafetyStreamPage([], "mock-safety-cursor", False)
 
     async def retrieve_camera_snapshots(
+        self, vehicle_id: str, event_time: datetime
+    ) -> list[dict[str, Any]]:
+        return []
+
+    async def retrieve_camera_video(
         self, vehicle_id: str, event_time: datetime
     ) -> list[dict[str, Any]]:
         return []
