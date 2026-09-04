@@ -21,6 +21,21 @@ async def test_feed_request_and_cursor():
 
 
 @pytest.mark.asyncio
+async def test_current_fuel_snapshot_requests_gps_and_fuel():
+    async def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.path == "/fleet/vehicles/stats"
+        assert request.url.params["types"] == "gps,fuelPercents"
+        return httpx.Response(200, json={"data": [{"id": "vehicle-1"}]})
+
+    client = SamsaraClient(
+        "secret", "https://api.samsara.com", transport=httpx.MockTransport(handler)
+    )
+    rows = await client.get_current_fuel_snapshot()
+    await client.close()
+    assert rows == [{"id": "vehicle-1"}]
+
+
+@pytest.mark.asyncio
 async def test_authentication_error():
     client = SamsaraClient(
         "secret",

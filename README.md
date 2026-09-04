@@ -23,6 +23,7 @@ maintenance workflow status are deliberately separate.
 - **Read Vehicles** for full VIN/make/model/license metadata
 - **Read Safety Events & Scores** for safety alerts
 - **Read Camera Media** for safety-event video
+- **Read Vehicle Statistics** also covers current GPS and fuel-level snapshots
 - **Read Media Retrieval** and **Write Media Retrieval** to request dashcam
   footage around speeding alerts
 - Telegram bot that can send messages in the destination group/topic
@@ -99,8 +100,8 @@ its environment. Administrators manage them from Telegram:
 - `/addSamsara` in the bot's private chat validates and encrypts a new API token.
 - `/samsaras` lists configured account names without exposing tokens.
 - `/removeSamsara <name>` disables an account and all of its routes.
-- `/activate` in a group or forum thread selects Fault codes, Safety alerts, or
-  Both, then asks for the custom Samsara account name.
+- `/activate` in a group or forum thread selects Fault codes, Safety alerts,
+  Fuel notifications, Both, or All, then asks for the custom Samsara account name.
 - `/deactivate` disables routes only in the exact group/thread where it is sent.
 
 Each group thread is an independent route. Activating one topic never activates
@@ -149,6 +150,7 @@ maintenance group explicitly wants those initial alerts.
 - `/fault_test`, `/fault_help`
 - `/safety`, `/safety_today`, `/safety_active`
 - `/safety_summary`, `/safety_stats`, `/safety_test`
+- `/currentfuel`
 
 Alerts include acknowledge, start-work, note, assign, ignore, and refresh controls.
 Acknowledgement, start-work, and confirmed-ignore changes are persisted and
@@ -162,6 +164,13 @@ controls. New events are deduplicated by Samsara event ID and receive
 lookback, saves its cursor, and suppresses historical alerts by default. When
 Samsara provides a usable media URL, the sender attempts video delivery and falls
 back to the complete text alert if Telegram cannot retrieve it.
+
+Fuel notifications are route-gated like faults and safety alerts. After an admin
+activates Fuel notifications or All in a group/topic, authorized users can run
+`/currentfuel` there. The bot fetches the latest Samsara vehicle stats snapshot
+for GPS and `fuelPercents`, then lists unit names with coordinates and fuel
+levels sorted from lowest fuel percentage to highest. Vehicles missing fuel data
+are listed last.
 
 Speeding alerts do not include dashcam video in the alert webhook itself. When a
 speeding safety event has no attached media, the monitor requests a 20-second

@@ -53,12 +53,13 @@ def build_admin_router(
             "/removeSamsara &lt;name&gt; — disable an account and its routes\n"
             "/samsaras — list configured Samsara accounts\n\n"
             "<b>Group or exact forum thread</b>\n"
-            "/activate — route fault codes, safety alerts, or both\n"
+            "/activate — route fault codes, safety alerts, fuel notifications, or all\n"
             "/deactivate — disable routes only in this exact group/thread\n\n"
             "<b>Information and testing</b>\n"
             "/help — show this admin command list\n"
             "/fault_help — show fault lookup commands\n"
             "/safety — show recent safety alerts\n"
+            "/currentfuel — show current fuel, sorted low to high\n"
             "/safety_test — test safety-message delivery\n"
             "/fault_test — test fault-message delivery",
             parse_mode="HTML",
@@ -168,7 +169,11 @@ def build_admin_router(
         await message.answer(
             "Choose what this exact group/thread receives:",
             reply_markup=ReplyKeyboardMarkup(
-                keyboard=[[KeyboardButton(text="Fault codes"), KeyboardButton(text="Safety alerts")], [KeyboardButton(text="Both")]],
+                keyboard=[
+                    [KeyboardButton(text="Fault codes"), KeyboardButton(text="Safety alerts")],
+                    [KeyboardButton(text="Fuel notifications"), KeyboardButton(text="Both")],
+                    [KeyboardButton(text="All")],
+                ],
                 resize_keyboard=True,
                 one_time_keyboard=True,
             ),
@@ -176,10 +181,16 @@ def build_admin_router(
 
     @router.message(ActivateRoute.purpose)
     async def activate_purpose(message: Message, state: FSMContext) -> None:
-        choices = {"fault codes": "fault", "safety alerts": "safety", "both": "both"}
+        choices = {
+            "fault codes": "fault",
+            "safety alerts": "safety",
+            "fuel notifications": "fuel",
+            "both": "both",
+            "all": "all",
+        }
         purpose = choices.get((message.text or "").strip().lower())
         if not purpose:
-            await message.answer("Choose Fault codes, Safety alerts, or Both.")
+            await message.answer("Choose Fault codes, Safety alerts, Fuel notifications, Both, or All.")
             return
         await state.update_data(purpose=purpose)
         await state.set_state(ActivateRoute.account)

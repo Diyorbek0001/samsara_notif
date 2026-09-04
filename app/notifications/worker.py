@@ -231,7 +231,7 @@ class OutboxWorker:
                         select(TelegramRoute).where(
                             TelegramRoute.samsara_account_id == integration_id,
                             TelegramRoute.active.is_(True),
-                            TelegramRoute.purpose.in_((item.category, "both")),
+                            TelegramRoute.purpose.in_((item.category, "both", "all")),
                         ).order_by(TelegramRoute.id)
                     )
                 ).all()
