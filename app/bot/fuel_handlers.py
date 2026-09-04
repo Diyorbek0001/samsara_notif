@@ -25,13 +25,15 @@ class FuelSnapshotRow:
     fuel_percent: float | None
 
 
-def _latest_stat(stats: Any) -> dict[str, Any] | None:
+def _latest_stat(stats: Any) -> Any:
     if isinstance(stats, list):
-        candidates = [item for item in stats if isinstance(item, dict)]
+        candidates = [item for item in stats if item is not None]
         if not candidates:
             return None
         return candidates[-1]
     if isinstance(stats, dict):
+        return stats
+    if isinstance(stats, (int, float, str)):
         return stats
     return None
 
@@ -41,6 +43,36 @@ def _number(value: Any) -> float | None:
         return float(value)
     except (TypeError, ValueError):
         return None
+
+
+def _first_present(mapping: dict[str, Any], keys: tuple[str, ...]) -> Any:
+    lowered = {key.lower(): value for key, value in mapping.items()}
+    for key in keys:
+        if key.lower() in lowered:
+            return lowered[key.lower()]
+    return None
+
+
+def _find_number(value: Any, keys: tuple[str, ...]) -> float | None:
+    direct = _number(value)
+    if direct is not None:
+        return direct
+    if isinstance(value, dict):
+        present = _first_present(value, keys)
+        if present is not None:
+            found = _find_number(present, keys)
+            if found is not None:
+                return found
+        for item in value.values():
+            found = _find_number(item, keys)
+            if found is not None:
+                return found
+    if isinstance(value, list):
+        for item in reversed(value):
+            found = _find_number(item, keys)
+            if found is not None:
+                return found
+    return None
 
 
 def _unit_name(vehicle: dict[str, Any]) -> str:
@@ -55,16 +87,33 @@ def parse_fuel_snapshot(payload: list[dict[str, Any]]) -> list[FuelSnapshotRow]:
     rows: list[FuelSnapshotRow] = []
     for vehicle in payload:
         gps = _latest_stat(vehicle.get("gps"))
-        fuel = _latest_stat(vehicle.get("fuelPercents"))
-        fuel_value = None
-        if fuel:
-            fuel_value = _number(fuel.get("value") if "value" in fuel else fuel.get("fuelPercent"))
+        fuel = _latest_stat(
+            _first_present(
+                vehicle,
+                (
+                    "fuelPercents",
+                    "fuelPercent",
+                    "fuelPercentage",
+                    "fuelLevelPercent",
+                    "fuelLevelPercents",
+                ),
+            )
+        )
         rows.append(
             FuelSnapshotRow(
                 unit_name=_unit_name(vehicle),
-                latitude=_number(gps.get("latitude")) if gps else None,
-                longitude=_number(gps.get("longitude")) if gps else None,
-                fuel_percent=fuel_value,
+                latitude=_find_number(gps, ("latitude", "lat")),
+                longitude=_find_number(gps, ("longitude", "lng", "lon")),
+                fuel_percent=_find_number(
+                    fuel,
+                    (
+                        "value",
+                        "fuelPercent",
+                        "fuelPercentage",
+                        "fuelLevelPercent",
+                        "percent",
+                    ),
+                ),
             )
         )
     return sorted(

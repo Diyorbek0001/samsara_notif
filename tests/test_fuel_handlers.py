@@ -41,3 +41,25 @@ def test_fuel_snapshot_message_lists_coordinates_and_fuel() -> None:
     assert "Truck &lt;1&gt;" in text
     assert "12.5%" in text
     assert "40.123457, -74.765432" in text
+
+
+def test_fuel_snapshot_accepts_singular_and_nested_fuel_fields() -> None:
+    rows = parse_fuel_snapshot(
+        [
+            {
+                "name": "Truck 40",
+                "gps": {"lat": "40.1", "lng": "-74.2"},
+                "fuelPercent": {"time": "2026-09-05T00:00:00Z", "value": {"percent": 44}},
+            },
+            {
+                "name": "Truck 50",
+                "gps": {"latitude": 41.1, "longitude": -75.2},
+                "fuelLevelPercent": [{"time": "2026-09-05T00:00:00Z", "fuelPercentage": "9"}],
+            },
+        ]
+    )
+
+    assert [(row.unit_name, row.fuel_percent) for row in rows] == [
+        ("Truck 50", 9.0),
+        ("Truck 40", 44.0),
+    ]
