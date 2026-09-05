@@ -150,16 +150,8 @@ def build_fuel_router(
     router = Router()
     cipher = TokenCipher(settings.token_encryption_key)
 
-    def authorized(user: object | None) -> bool:
-        return bool(user) and settings.is_authorized(
-            getattr(user, "id", None), getattr(user, "username", None)
-        )
-
     @router.message(Command("currentfuel", ignore_case=True))
     async def current_fuel(message: Message) -> None:
-        if not authorized(message.from_user):
-            await message.answer("Not authorized.")
-            return
         if message.chat.type not in {"group", "supergroup"}:
             await message.answer("Use /currentfuel in an activated group or topic.")
             return
