@@ -13,7 +13,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from sqlalchemy.orm import selectinload
 
 from app.bot.formatters import cleared_message, fault_message
-from app.bot.safety_formatters import safety_message
+from app.bot.safety_formatters import safety_message, speed_update_message
 from app.config import Settings
 from app.database.models import FaultIncident, NotificationLog, NotificationOutbox, SafetyEvent, TelegramRoute
 
@@ -114,10 +114,7 @@ class OutboxWorker:
                             f"{escape(safety_event.vehicle.vehicle_name if safety_event.vehicle and safety_event.vehicle.vehicle_name else 'Unknown')}"
                         )
                     elif item.notification_type == "speed_update":
-                        text = (
-                            "🔄 <b>Speeding details update</b>\n\n"
-                            + safety_message(safety_event, self.settings.timezone)
-                        )
+                        text = speed_update_message(safety_event)
                     else:
                         text = safety_message(safety_event, self.settings.timezone)
                     safety_chat_id = route.chat_id
@@ -172,11 +169,20 @@ class OutboxWorker:
                         except Exception:
                             logger.warning("safety_media_group_send_failed alert_id=%s", safety_event.alert_id)
                     if message is None:
+                        # Older alerts have no stored reference for editing, but
+                        # the first delivered alert's message id is on the event.
+                        reply_to = (
+                            safety_event.telegram_message_id
+                            if item.notification_type == "speed_update"
+                            and safety_event.telegram_chat_id == safety_chat_id
+                            else None
+                        )
                         message = await self.bot.send_message(
                             chat_id=safety_chat_id,
                             message_thread_id=safety_topic_id,
                             text=text,
                             parse_mode="HTML",
+                            reply_to_message_id=reply_to,
                             reply_markup=None,
                         )
                 else:
@@ -309,7 +315,8 @@ class OutboxWorker:
             await self.bot.send_message(
                 chat_id=ref["sent_chat_id"],
                 message_thread_id=route.thread_id,
-                text="🔄 Updated",
+                text=speed_update_message(safety_event),
+                parse_mode="HTML",
                 reply_to_message_id=ref["sent_message_id"],
             )
         except Exception as exc:

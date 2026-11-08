@@ -338,7 +338,63 @@ async def test_speed_update_edits_the_original_alert(tmp_path) -> None:
     assert edit["message_id"] == original_id and edit["chat_id"] == -100
     assert "Posted limit:</b> 65 mph" in edit["text"]
     reply = bot.calls[2][1]
-    assert reply["text"] == "🔄 Updated" and reply["reply_to_message_id"] == original_id
+    assert reply["reply_to_message_id"] == original_id
+    assert reply["text"] == (
+        "🔄 <b>Speeding details update</b>\n"
+        "<b>⚠️ LOW ALERT: LIGHT SPEEDING</b>\n"
+        f"<b>Alert ID:</b> {row.alert_id}\n"
+        "🚛 <b>Maximum speed:</b> 80 mph\n"
+        "🚦 <b>Posted limit:</b> 65 mph\n"
+        "⚡ <b>Over limit:</b> 15 mph\n"
+        "⏱ <b>Duration:</b> 104 seconds"
+    )
     async with sessions() as session:
         statuses = {r.notification_type: r.status for r in (await session.scalars(select(NotificationOutbox))).all()}
     assert statuses == {"new": "sent", "speed_update": "sent"}
+
+
+async def test_speed_update_for_older_alert_replies_without_edit(tmp_path) -> None:
+    from cryptography.fernet import Fernet
+    from app.database.models import SamsaraAccount, TelegramRoute
+    from app.notifications.worker import OutboxWorker
+    from app.safety.service import process_safety_event, queue_speed_update
+
+    engine, sessions = create_database(f"sqlite+aiosqlite:///{tmp_path / 'edit.db'}")
+    await create_tables(engine)
+    now = datetime.now(UTC)
+    async with sessions.begin() as session:
+        account = SamsaraAccount(name="acb", encrypted_api_token="x", active=True, created_at=now, updated_at=now)
+        session.add(account)
+        await session.flush()
+        session.add(TelegramRoute(samsara_account_id=account.id, chat_id=-100, thread_id=None,
+                                  purpose="all", active=True, created_at=now, updated_at=now))
+        await session.flush()
+        parsed = parse_safety_event(_raw_event("e1"))
+        row, _ = await process_safety_event(session, parsed, initialization=False, send_initial=False,
+                                            timezone="America/New_York", integration_id=account.id,
+                                            notification_delay_seconds=0)
+        event_id = row.id
+
+    settings = Settings(token_encryption_key=Fernet.generate_key().decode())
+    bot = FakeBot()
+    worker = OutboxWorker(settings, sessions, bot)
+    assert await worker.send_pending_once() == 1
+    assert [c[0] for c in bot.calls] == ["send_message"]
+    original_id = 101  # FakeBot numbers messages from 101
+
+    async with sessions.begin() as session:
+        row = await session.get(SafetyEvent, event_id)
+        details = {"maxSpeedMph": 80.0, "postedSpeedLimitMph": 65.0, "overLimitMph": 15.0, "durationSeconds": 104}
+        row.raw_event_json = {**row.raw_event_json, "speedingDetails": details}
+        assert await queue_speed_update(session, row, details, 1)
+
+    async with sessions.begin() as session:  # simulate an alert sent before refs were stored
+        first = await session.scalar(select(NotificationOutbox).where(NotificationOutbox.notification_type == "new"))
+        first.payload_json = {k: v for k, v in first.payload_json.items() if not k.startswith("sent_")}
+
+    await worker.send_pending_once()
+    assert [c[0] for c in bot.calls] == ["send_message", "send_message"]
+    update = bot.calls[1][1]
+    assert update["reply_to_message_id"] == original_id
+    assert update["text"].startswith("🔄 <b>Speeding details update</b>")
+    assert "Review status" not in update["text"]

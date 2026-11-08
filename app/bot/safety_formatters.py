@@ -40,15 +40,49 @@ def behavior_label(label: str) -> str:
     return re.sub(r"(?<=[a-z])(?=[A-Z])", " ", label).strip()
 
 
+def speed_lines(event: SafetyEvent) -> list[str]:
+    speed = (
+        event.raw_event_json.get("speedingDetails")
+        if isinstance(event.raw_event_json, dict)
+        else None
+    )
+    lines: list[str] = []
+    if isinstance(speed, dict) and speed.get("maxSpeedMph") is not None:
+        maximum = round(float(speed["maxSpeedMph"]))
+        lines.append(f"🚛 <b>Maximum speed:</b> {maximum} mph")
+        if speed.get("postedSpeedLimitMph") is not None:
+            limit = round(float(speed["postedSpeedLimitMph"]))
+            lines.append(f"🚦 <b>Posted limit:</b> {limit} mph")
+        if speed.get("overLimitMph") is not None:
+            over = round(float(speed["overLimitMph"]))
+            lines.append(f"⚡ <b>Over limit:</b> {over} mph")
+        if speed.get("durationSeconds") is not None:
+            lines.append(f"⏱ <b>Duration:</b> {int(speed['durationSeconds'])} seconds")
+    return lines
+
+
+def alert_title(event: SafetyEvent) -> str:
+    label = behavior_label(event.primary_behavior).upper()
+    if event.severity != "unknown":
+        return f"⚠️ {event.severity.upper()} ALERT: {label}"
+    return f"⚠️ SAFETY ALERT: {label}"
+
+
+def speed_update_message(event: SafetyEvent) -> str:
+    """Short follow-up with only what changed (the speeding numbers)."""
+    lines = [
+        "🔄 <b>Speeding details update</b>",
+        f"<b>{escape(alert_title(event))}</b>",
+        f"<b>Alert ID:</b> {escape(event.alert_id)}",
+    ]
+    return "\n".join(lines + speed_lines(event))
+
+
 def safety_message(event: SafetyEvent, timezone: str, test: bool = False) -> str:
     title = (
         "🧪 TEST — NOT A REAL FLEET ALERT"
         if test
-        else (
-            f"⚠️ {event.severity.upper()} ALERT: {behavior_label(event.primary_behavior).upper()}"
-            if event.severity != "unknown"
-            else f"⚠️ SAFETY ALERT: {behavior_label(event.primary_behavior).upper()}"
-        )
+        else alert_title(event)
     )
     lines = [
         f"<b>{escape(title)}</b>",
@@ -87,22 +121,7 @@ def safety_message(event: SafetyEvent, timezone: str, test: bool = False) -> str
     inbox = samsara_inbox_url(event)
     if inbox:
         lines.append(f'🔗 <a href="{escape(inbox, quote=True)}">Samsara Safety Inbox</a>')
-    speed = (
-        event.raw_event_json.get("speedingDetails")
-        if isinstance(event.raw_event_json, dict)
-        else None
-    )
-    if isinstance(speed, dict) and speed.get("maxSpeedMph") is not None:
-        maximum = round(float(speed["maxSpeedMph"]))
-        lines.append(f"🚛 <b>Maximum speed:</b> {maximum} mph")
-        if speed.get("postedSpeedLimitMph") is not None:
-            limit = round(float(speed["postedSpeedLimitMph"]))
-            lines.append(f"🚦 <b>Posted limit:</b> {limit} mph")
-        if speed.get("overLimitMph") is not None:
-            over = round(float(speed["overLimitMph"]))
-            lines.append(f"⚡ <b>Over limit:</b> {over} mph")
-        if speed.get("durationSeconds") is not None:
-            lines.append(f"⏱ <b>Duration:</b> {int(speed['durationSeconds'])} seconds")
+    lines.extend(speed_lines(event))
     lines.extend(
         [
             "",
