@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 from datetime import UTC, datetime
 
 from aiogram import F, Router
@@ -13,10 +14,14 @@ from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from app.config import Settings
+from app.bot.routing import migrate_chat_routes
 from app.database.models import SamsaraAccount, TelegramRoute
 from app.safety.topics import OTHER, SAFETY_TOPICS
 from app.samsara.client import SamsaraClient
 from app.security import TokenCipher
+
+
+logger = logging.getLogger(__name__)
 
 
 class AddSamsara(StatesGroup):
@@ -458,6 +463,17 @@ def build_admin_router(
         if disabled:
             lines.append(f"Turned off {disabled} older route(s) in this group so alerts aren't sent twice.")
         await message.edit_text("\n".join(lines))
+
+    @router.message(F.migrate_to_chat_id)
+    async def group_migrated(message: Message) -> None:
+        async with sessions.begin() as session:
+            moved, disabled = await migrate_chat_routes(
+                session, message.chat.id, message.migrate_to_chat_id
+            )
+        logger.warning(
+            "telegram_chat_migrated old_chat_id=%d new_chat_id=%d routes_moved=%d routes_disabled=%d",
+            message.chat.id, message.migrate_to_chat_id, moved, disabled,
+        )
 
     @router.message(Command("deactivate", ignore_case=True))
     async def deactivate(message: Message) -> None:

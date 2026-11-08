@@ -442,3 +442,68 @@ async def test_safety_alert_goes_only_to_its_type_topic(tmp_path) -> None:
         (3, "<b>⚠️ MODERATE ALERT: MOBILE USAGE</b>"),
         (4, "<b>⚠️ LOW ALERT: UNSAFE PARKING</b>"),
     ]
+
+
+async def test_migrated_group_stops_failing_and_uses_topics(tmp_path) -> None:
+    """Old basic group (-100) became a supergroup (-1009) that already has topics."""
+    from aiogram.exceptions import TelegramMigrateToChat
+    from aiogram.methods import SendMessage
+    from cryptography.fernet import Fernet
+    from app.database.models import SamsaraAccount, TelegramRoute
+    from app.notifications.worker import OutboxWorker
+    from app.safety.service import process_safety_event
+
+    engine, sessions = create_database(f"sqlite+aiosqlite:///{tmp_path / 'mig.db'}")
+    await create_tables(engine)
+    now = datetime.now(UTC)
+    async with sessions.begin() as session:
+        account = SamsaraAccount(name="acb", encrypted_api_token="x", active=True, created_at=now, updated_at=now)
+        session.add(account)
+        await session.flush()
+        session.add(TelegramRoute(samsara_account_id=account.id, chat_id=-100, thread_id=None,
+                                  purpose="all", active=True, created_at=now, updated_at=now))
+        session.add(TelegramRoute(samsara_account_id=account.id, chat_id=-1009, thread_id=7,
+                                  purpose="s:speeding", active=True, created_at=now, updated_at=now))
+        await session.flush()
+        await process_safety_event(session, parse_safety_event(_raw_event("m1")), initialization=False,
+                                   send_initial=False, timezone="America/New_York",
+                                   integration_id=account.id, notification_delay_seconds=0)
+
+    class MigratingBot(FakeBot):
+        async def send_message(self, **kwargs):
+            if kwargs["chat_id"] == -100:
+                raise TelegramMigrateToChat(method=SendMessage(chat_id=-100, text="x"),
+                                            message="group upgraded", migrate_to_chat_id=-1009)
+            return await super().send_message(**kwargs)
+
+    bot = MigratingBot()
+    worker = OutboxWorker(Settings(token_encryption_key=Fernet.generate_key().decode()), sessions, bot)
+    for _ in range(3):
+        await worker.send_pending_once()
+
+    assert [(c[1]["chat_id"], c[1]["message_thread_id"]) for c in bot.calls] == [(-1009, 7)]
+    async with sessions() as session:
+        routes = {(r.chat_id, r.thread_id): r.active for r in (await session.scalars(select(TelegramRoute))).all()}
+        statuses = sorted(r.status for r in (await session.scalars(select(NotificationOutbox))).all())
+    assert routes == {(-100, None): False, (-1009, 7): True}
+    assert statuses == ["dead", "sent"]  # the old-group copy is dropped, not retried forever
+
+
+async def test_migration_moves_routes_when_new_group_has_none(tmp_path) -> None:
+    from app.bot.routing import migrate_chat_routes
+    from app.database.models import SamsaraAccount, TelegramRoute
+
+    engine, sessions = create_database(f"sqlite+aiosqlite:///{tmp_path / 'mig2.db'}")
+    await create_tables(engine)
+    now = datetime.now(UTC)
+    async with sessions.begin() as session:
+        account = SamsaraAccount(name="acb", encrypted_api_token="x", active=True, created_at=now, updated_at=now)
+        session.add(account)
+        await session.flush()
+        session.add(TelegramRoute(samsara_account_id=account.id, chat_id=-100, thread_id=None,
+                                  purpose="all", active=True, created_at=now, updated_at=now))
+    async with sessions.begin() as session:
+        assert await migrate_chat_routes(session, -100, -1009) == (1, 0)
+    async with sessions() as session:
+        route = await session.scalar(select(TelegramRoute))
+    assert (route.chat_id, route.active) == (-1009, True)

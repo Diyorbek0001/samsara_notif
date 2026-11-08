@@ -6,13 +6,14 @@ from datetime import UTC, datetime, timedelta
 from html import escape
 
 from aiogram import Bot
-from aiogram.exceptions import TelegramBadRequest
+from aiogram.exceptions import TelegramBadRequest, TelegramMigrateToChat
 from aiogram.types import InputMediaPhoto, InputMediaVideo
 from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from sqlalchemy.orm import selectinload
 
 from app.bot.formatters import cleared_message, fault_message
+from app.bot.routing import migrate_chat_routes
 from app.bot.safety_formatters import safety_message, speed_update_message
 from app.config import Settings
 from app.safety.topics import topic_for
@@ -91,7 +92,9 @@ class OutboxWorker:
             if item.category == "safety" and not safety_event:
                 await self._fail(item_id, "Safety event no longer exists", dead=True)
                 continue
-            if route is None:
+            if route is None or not route.active:
+                # Turned off by /deactivate or /setup_topics after this alert
+                # was queued for it.
                 await self._fail(
                     item_id,
                     "No active Telegram group/thread route for this notification",
@@ -203,6 +206,9 @@ class OutboxWorker:
                         reply_to_message_id=reply_to,
                         reply_markup=None,
                     )
+            except TelegramMigrateToChat as exc:
+                await self._chat_migrated(item_id, route.chat_id, exc.migrate_to_chat_id)
+                continue
             except Exception as exc:
                 await self._fail(item_id, f"{type(exc).__name__}: {exc}")
                 continue
@@ -337,6 +343,19 @@ class OutboxWorker:
             row.payload_json = {**(row.payload_json or {}), "edited_message_id": ref["sent_message_id"]}
         logger.info("safety_alert_edited alert_id=%s", safety_event.alert_id)
         return True
+
+    async def _chat_migrated(self, item_id: int, old_chat_id: int, new_chat_id: int) -> None:
+        async with self.sessions.begin() as session:
+            moved, disabled = await migrate_chat_routes(session, old_chat_id, new_chat_id)
+            item = await session.get(NotificationOutbox, item_id)
+            # Retry right away: either the route now points at the new chat,
+            # or it was turned off and the retry drops the alert cleanly.
+            item.status, item.next_attempt_at, item.processing_at = "failed", datetime.now(UTC), None
+            item.last_error = f"Chat migrated to {new_chat_id}"
+        logger.warning(
+            "telegram_chat_migrated old_chat_id=%d new_chat_id=%d routes_moved=%d routes_disabled=%d",
+            old_chat_id, new_chat_id, moved, disabled,
+        )
 
     async def _expand_routes(self, item_id: int) -> None:
         async with self.sessions.begin() as session:
