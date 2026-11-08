@@ -265,3 +265,14 @@ async def test_obstructed_camera_alert_waits_for_still_then_sends_with_it(tmp_pa
         "America/New_York",
     )
     assert "📸 <b>Camera snapshot:</b>" in text and "2 min after the event" in text
+
+
+def test_pick_still_uses_exact_safety_event_still_first() -> None:
+    event = datetime(2026, 11, 8, 16, 40, 33, 53000, tzinfo=UTC)
+    exact = _still("dashcamDriverFacing", event) | {"triggerReason": "safetyEvent"}
+    periodic = [
+        _still("dashcamRoadFacing", event + timedelta(minutes=2)) | {"triggerReason": "periodicStill"},
+        _still("dashcamDriverFacing", event + timedelta(minutes=2)) | {"triggerReason": "periodicStill"},
+    ]
+    media, is_after = SafetyMonitor._pick_still(periodic + [exact], event)
+    assert is_after and media == [exact]

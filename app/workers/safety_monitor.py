@@ -94,10 +94,24 @@ class SafetyMonitor:
     def _pick_still(stills: list[dict], event_time: datetime) -> tuple[list[dict], bool]:
         """Pick the dashcam stills that best show the camera at event time.
 
-        Prefers the first capture at/after the event (it shows the obstruction),
-        otherwise the latest capture before it. Returns all camera inputs from
+        Prefers Samsara's still from the exact event moment, then the first
+        capture after the event (it shows the obstruction), otherwise the
+        latest capture before it. Returns all camera inputs from
         that capture (road + driver) and whether it was taken after the event.
         """
+        order = {"dashcamRoadFacing": 0, "dashcamDriverFacing": 1}
+        tolerance = timedelta(seconds=30)
+        # Samsara saves a still at the exact moment of the safety event
+        # (triggerReason "safetyEvent"), from the camera that triggered it.
+        # That is the exact view of the obstruction, so use it when present.
+        exact = [
+            still for still in stills
+            if still.get("triggerReason") == "safetyEvent"
+            and (captured := _parse_time(still.get("capturedAt")))
+            and abs(captured - event_time) <= tolerance
+        ]
+        if exact:
+            return sorted(exact, key=lambda item: order.get(item["input"], 2)), True
         by_time: dict[datetime, list[dict]] = {}
         for still in stills:
             captured = _parse_time(still.get("capturedAt"))
@@ -105,13 +119,11 @@ class SafetyMonitor:
                 by_time.setdefault(captured, []).append(still)
         if not by_time:
             return [], False
-        tolerance = timedelta(seconds=30)
         after = sorted(t for t in by_time if t >= event_time - tolerance)
         if after:
             chosen, is_after = after[0], True
         else:
             chosen, is_after = max(by_time), False
-        order = {"dashcamRoadFacing": 0, "dashcamDriverFacing": 1}
         group = sorted(by_time[chosen], key=lambda item: order.get(item["input"], 2))
         return group, is_after
 
