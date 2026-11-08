@@ -49,7 +49,8 @@ def build_admin_router(
             "/samsaras — list configured Samsara accounts\n\n"
             "<b>Group or exact forum thread</b>\n"
             "/activate — route fault codes, safety alerts, fuel notifications, or all\n"
-            "/deactivate — disable routes only in this exact group/thread\n\n"
+            "/deactivate — disable routes only in this exact group/thread\n"
+            "/setup_topics — create Faults, Safety and Fuel topics in this group\n\n"
             "<b>Information and testing</b>\n"
             "/help — show this admin command list\n"
             "/fault_help — show fault lookup commands\n"
@@ -274,6 +275,170 @@ def build_admin_router(
             await callback.answer("Activated.")
             return
         await callback.answer()
+
+    # /setup_topics: one forum topic per alert category in this group.
+    topic_plan = [
+        ("fault", "🛠 Faults", 0xFB6F5F),
+        ("safety", "⚠️ Safety", 0xFFD67E),
+        ("fuel", "⛽ Fuel", 0x6FB9F0),
+    ]
+    topic_intro = {
+        "fault": "This topic receives fault code alerts for '{name}'.",
+        "safety": "This topic receives safety alerts for '{name}'.",
+        "fuel": "Fuel topic for '{name}'. Use /currentfuel here.",
+    }
+
+    @router.message(Command("setup_topics", ignore_case=True))
+    async def setup_topics_start(message: Message) -> None:
+        if message.chat.type != "supergroup" or not admin(message):
+            await message.answer("Admin-only command. Use it in the fleet group.")
+            return
+        if not message.chat.is_forum:
+            await message.answer(
+                "Topics are off in this group. Turn on Topics in the group settings, then run /setup_topics again."
+            )
+            return
+        async with sessions() as session:
+            accounts = list(
+                (
+                    await session.scalars(
+                        select(SamsaraAccount)
+                        .where(SamsaraAccount.active.is_(True))
+                        .order_by(SamsaraAccount.name)
+                    )
+                ).all()
+            )
+        if not accounts:
+            await message.answer("No active Samsara accounts. Add one with /addSamsara in private chat.")
+            return
+        rows = [
+            [InlineKeyboardButton(text=account.name, callback_data=f"topics:{account.id}")]
+            for account in accounts[:50]
+        ]
+        rows.append([InlineKeyboardButton(text="Cancel", callback_data="topics:cancel")])
+        await message.answer(
+            "Create Faults, Safety and Fuel topics in this group for which Samsara account?",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=rows),
+        )
+
+    @router.callback_query(F.data.startswith("topics:"))
+    async def setup_topics_callback(callback: CallbackQuery) -> None:
+        message = callback.message
+        if not isinstance(message, Message) or message.chat.type != "supergroup":
+            await callback.answer()
+            return
+        if not callback_admin(callback):
+            await callback.answer("Admin-only.", show_alert=True)
+            return
+        value = (callback.data or "").split(":", 1)[1]
+        if value == "cancel":
+            await message.edit_text("Topic setup cancelled.")
+            await callback.answer()
+            return
+        if not value.isdigit():
+            await callback.answer()
+            return
+        chat_id = message.chat.id
+        async with sessions() as session:
+            account = await session.get(SamsaraAccount, int(value))
+            if not account or not account.active:
+                await callback.answer("That Samsara account is no longer active.", show_alert=True)
+                return
+            account_id, account_name = account.id, account.name
+            existing = list(
+                (
+                    await session.scalars(
+                        select(TelegramRoute).where(
+                            TelegramRoute.samsara_account_id == account_id,
+                            TelegramRoute.chat_id == chat_id,
+                            TelegramRoute.active.is_(True),
+                        )
+                    )
+                ).all()
+            )
+        # Re-running reuses topics this command already created.
+        have = {
+            route.purpose: route.thread_id
+            for route in existing
+            if route.purpose in {"fault", "safety", "fuel"} and route.thread_id is not None
+        }
+        await callback.answer("Setting up topics…")
+        created: dict[str, int] = {}
+        for purpose, title, color in topic_plan:
+            if purpose in have:
+                continue
+            try:
+                topic = await message.bot.create_forum_topic(
+                    chat_id=chat_id, name=title, icon_color=color
+                )
+            except Exception as exc:
+                await message.edit_text(
+                    f"Couldn't create the {title} topic ({type(exc).__name__}). "
+                    "Make sure the bot is an admin with the 'Manage topics' right, then run /setup_topics again."
+                )
+                if not created:
+                    return
+                break
+            created[purpose] = topic.message_thread_id
+        threads = {**have, **created}
+        now = datetime.now(UTC)
+        disabled = 0
+        async with sessions.begin() as session:
+            routes = list(
+                (
+                    await session.scalars(
+                        select(TelegramRoute).where(
+                            TelegramRoute.samsara_account_id == account_id,
+                            TelegramRoute.chat_id == chat_id,
+                        )
+                    )
+                ).all()
+            )
+            by_thread = {route.thread_id: route for route in routes}
+            for purpose, thread_id in threads.items():
+                route = by_thread.get(thread_id)
+                if route:
+                    route.purpose, route.active, route.updated_at = purpose, True, now
+                else:
+                    session.add(
+                        TelegramRoute(
+                            samsara_account_id=account_id,
+                            chat_id=chat_id,
+                            thread_id=thread_id,
+                            chat_title=message.chat.title,
+                            purpose=purpose,
+                            active=True,
+                            created_by_telegram_id=callback.from_user.id,
+                            created_at=now,
+                            updated_at=now,
+                        )
+                    )
+            # Older routes in this group (e.g. "All" in General) would now
+            # duplicate every alert, so turn them off.
+            for route in routes:
+                if route.active and route.thread_id not in threads.values():
+                    route.active, route.updated_at = False, now
+                    disabled += 1
+        for purpose, thread_id in created.items():
+            try:
+                await message.bot.send_message(
+                    chat_id=chat_id,
+                    message_thread_id=thread_id,
+                    text=topic_intro[purpose].format(name=account_name),
+                )
+            except Exception:
+                pass
+        names = {purpose: title for purpose, title, _ in topic_plan}
+        lines = [f"Topics for '{account_name}':"]
+        for purpose, _, _ in topic_plan:
+            if purpose in threads:
+                state = "created" if purpose in created else "already set up"
+                lines.append(f"• {names[purpose]} — {state}")
+            else:
+                lines.append(f"• {names[purpose]} — not created")
+        if disabled:
+            lines.append(f"Turned off {disabled} older route(s) in this group so alerts aren't sent twice.")
+        await message.edit_text("\n".join(lines))
 
     @router.message(Command("deactivate", ignore_case=True))
     async def deactivate(message: Message) -> None:
