@@ -303,6 +303,21 @@ class OutboxWorker:
         except Exception as exc:
             await self._fail(item_id, f"{type(exc).__name__}: {exc}")
             return True
+        # Short reply so the group is notified; tapping it jumps to the
+        # updated alert. A failure here doesn't undo the edit.
+        try:
+            await self.bot.send_message(
+                chat_id=ref["sent_chat_id"],
+                message_thread_id=route.thread_id,
+                text="🔄 Updated",
+                reply_to_message_id=ref["sent_message_id"],
+            )
+        except Exception as exc:
+            logger.warning(
+                "safety_alert_update_reply_failed alert_id=%s error=%s",
+                safety_event.alert_id,
+                type(exc).__name__,
+            )
         async with self.sessions.begin() as session:
             row = await session.get(NotificationOutbox, item_id)
             row.status, row.sent_at, row.last_error, row.processing_at = (

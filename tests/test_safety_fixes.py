@@ -333,10 +333,12 @@ async def test_speed_update_edits_the_original_alert(tmp_path) -> None:
 
     await worker.send_pending_once()
     kinds = [c[0] for c in bot.calls]
-    assert kinds == ["send_message", "edit_message_text"]
+    assert kinds == ["send_message", "edit_message_text", "send_message"]
     edit = bot.calls[1][1]
     assert edit["message_id"] == original_id and edit["chat_id"] == -100
     assert "Posted limit:</b> 65 mph" in edit["text"]
+    reply = bot.calls[2][1]
+    assert reply["text"] == "🔄 Updated" and reply["reply_to_message_id"] == original_id
     async with sessions() as session:
         statuses = {r.notification_type: r.status for r in (await session.scalars(select(NotificationOutbox))).all()}
     assert statuses == {"new": "sent", "speed_update": "sent"}
