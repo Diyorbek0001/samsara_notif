@@ -10,7 +10,7 @@ from app.database.session import create_database, create_tables
 from app.samsara.exceptions import SamsaraAuthenticationError
 from app.samsara.safety_models import SafetyStreamPage
 from app.samsara.safety_parser import parse_safety_event, severity_for
-from app.workers.safety_monitor import SafetyMonitor
+from app.workers.safety_monitor import SafetyMonitor, SNAPSHOT_RECHECK_INTERVAL
 
 
 def _raw_event(event_id: str, label: str = "LightSpeeding", minutes_ago: int = 1) -> dict:
@@ -84,6 +84,13 @@ class FakeClient:
 
     async def retrieve_camera_snapshots(self, vehicle_id, event_time):
         raise SamsaraAuthenticationError("Samsara API authentication failed")
+
+    stills: list = []
+    still_calls = 0
+
+    async def get_camera_stills(self, vehicle_id, start_time, end_time):
+        self.still_calls += 1
+        return list(self.stills)
 
 
 async def _monitor(tmp_path, client):
@@ -187,3 +194,74 @@ def test_alert_links_to_samsara_safety_inbox() -> None:
 
     event.raw_event_json = {"inboxEventUrl": "https://evil.example/phish"}
     assert "Samsara Safety Inbox" not in safety_message(event, "America/New_York")
+
+
+def _still(camera: str, captured: datetime) -> dict:
+    return {
+        "input": camera,
+        "url": f"https://s3.samsara.com/{camera}-{captured.timestamp()}.jpeg",
+        "mediaType": "image",
+        "capturedAt": captured.isoformat().replace("+00:00", "Z"),
+    }
+
+
+def test_pick_still_prefers_first_capture_after_event() -> None:
+    event = datetime(2026, 11, 8, 12, 9, 7, tzinfo=UTC)
+    before = event - timedelta(minutes=3)
+    after = event + timedelta(minutes=2)
+    later = event + timedelta(minutes=8)
+    stills = [
+        _still("dashcamDriverFacing", after), _still("dashcamRoadFacing", after),
+        _still("dashcamRoadFacing", before), _still("dashcamRoadFacing", later),
+    ]
+    media, is_after = SafetyMonitor._pick_still(stills, event)
+    assert is_after
+    assert [m["input"] for m in media] == ["dashcamRoadFacing", "dashcamDriverFacing"]
+    assert all(m["capturedAt"].startswith("2026-11-08T12:11:07") for m in media)
+
+    media, is_after = SafetyMonitor._pick_still([_still("dashcamRoadFacing", before)], event)
+    assert not is_after and media
+
+
+async def test_obstructed_camera_alert_waits_for_still_then_sends_with_it(tmp_path) -> None:
+    raw = _raw_event("obs", label="ObstructedCamera", minutes_ago=1)
+    raw["media"] = [{"input": "MEDIA_INPUT_UNKNOWN", "url": ""}]
+    client = FakeClient([[], [raw], [raw]])
+    monitor, sessions = await _monitor(tmp_path, client)
+    await monitor.poll_once()  # baseline
+
+    event_time = datetime.fromisoformat(raw["startMs"].replace("Z", "+00:00"))
+    client.stills = [_still("dashcamRoadFacing", event_time - timedelta(minutes=4))]
+    await monitor.poll_once()  # only an older still so far: alert is held
+    async with sessions() as session:
+        held = await session.scalar(select(NotificationOutbox))
+        row = await session.scalar(select(SafetyEvent))
+    assert held.next_attempt_at.replace(tzinfo=UTC) > datetime.now(UTC) + timedelta(minutes=5)
+    assert row.raw_event_json["snapshotInfo"]["afterEvent"] is False
+
+    # The next periodic still (after the event) is uploaded.
+    client.stills.append(_still("dashcamRoadFacing", event_time + timedelta(minutes=2)))
+    client.stills.append(_still("dashcamDriverFacing", event_time + timedelta(minutes=2)))
+    from app.faults.service import state_get, state_set
+    import json
+    async with sessions.begin() as session:  # skip the 30 s recheck wait
+        key = "safety_snapshot:obs"
+        stored = json.loads(await state_get(session, key))
+        stored["checkedAt"] = (datetime.now(UTC) - SNAPSHOT_RECHECK_INTERVAL).isoformat()
+        await state_set(session, key, json.dumps(stored))
+    await monitor.poll_once()
+
+    async with sessions() as session:
+        released = await session.scalar(select(NotificationOutbox))
+        row = await session.scalar(select(SafetyEvent))
+    assert released.next_attempt_at.replace(tzinfo=UTC) <= datetime.now(UTC)
+    assert [m["input"] for m in row.media_json] == ["dashcamRoadFacing", "dashcamDriverFacing"]
+    assert row.raw_event_json["snapshotInfo"]["afterEvent"] is True
+    text = safety_message(
+        SimpleNamespace(**{c: getattr(row, c) for c in (
+            "severity", "primary_behavior", "behavior_labels_json", "alert_id",
+            "event_timestamp", "location_name", "latitude", "longitude",
+            "raw_event_json", "review_status", "coaching_status")}, driver=None, vehicle=None),
+        "America/New_York",
+    )
+    assert "📸 <b>Camera snapshot:</b>" in text and "2 min after the event" in text

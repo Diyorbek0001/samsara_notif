@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import re
+from datetime import UTC, datetime
 from html import escape
 from urllib.parse import urlparse
 from zoneinfo import ZoneInfo
@@ -65,6 +66,24 @@ def safety_message(event: SafetyEvent, timezone: str, test: bool = False) -> str
     if event.latitude is not None and event.longitude is not None:
         maps = f"https://www.google.com/maps/search/?api=1&amp;query={event.latitude:.6f},{event.longitude:.6f}"
         lines.append(f'🗺 <a href="{maps}">Google Maps</a>')
+    raw_info = event.raw_event_json if isinstance(event.raw_event_json, dict) else {}
+    snapshot = raw_info.get("snapshotInfo")
+    if isinstance(snapshot, dict) and snapshot.get("capturedAt"):
+        try:
+            captured = datetime.fromisoformat(str(snapshot["capturedAt"]).replace("Z", "+00:00"))
+        except ValueError:
+            captured = None
+        if captured:
+            event_time = event.event_timestamp
+            if event_time.tzinfo is None:
+                event_time = event_time.replace(tzinfo=UTC)
+            minutes = round(abs((captured - event_time).total_seconds()) / 60)
+            when = captured.astimezone(ZoneInfo(timezone)).strftime("%I:%M:%S %p %Z")
+            if snapshot.get("afterEvent"):
+                relation = "at the event" if minutes == 0 else f"{minutes} min after the event"
+            else:
+                relation = f"{minutes} min before the event — no newer image available"
+            lines.append(f"📸 <b>Camera snapshot:</b> {escape(when)} ({escape(relation)})")
     inbox = samsara_inbox_url(event)
     if inbox:
         lines.append(f'🔗 <a href="{escape(inbox, quote=True)}">Samsara Safety Inbox</a>')

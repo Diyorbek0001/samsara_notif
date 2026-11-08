@@ -158,6 +158,42 @@ class SamsaraClient:
             unique.setdefault(item["url"], item)
         return list(unique.values())
 
+    async def get_camera_stills(
+        self, vehicle_id: str, start_time: datetime, end_time: datetime
+    ) -> list[dict[str, Any]]:
+        """Dashcam still images Samsara already uploaded (periodic/trip stills).
+
+        Works with read-only camera access; no media retrieval request needed.
+        """
+        params: dict[str, Any] = {
+            "vehicleIds": vehicle_id,
+            "startTime": start_time.astimezone(UTC).isoformat().replace("+00:00", "Z"),
+            "endTime": end_time.astimezone(UTC).isoformat().replace("+00:00", "Z"),
+        }
+        stills: list[dict[str, Any]] = []
+        for _ in range(5):
+            payload = await self._get("/cameras/media", params)
+            data = payload.get("data")
+            items = (data.get("media") if isinstance(data, dict) else None) or []
+            for item in items:
+                if not isinstance(item, dict) or str(item.get("mediaType")).lower() != "image":
+                    continue
+                url = (item.get("urlInfo") or {}).get("url") if isinstance(item.get("urlInfo"), dict) else None
+                captured = item.get("startTime")
+                if isinstance(url, str) and url.startswith("https://") and isinstance(captured, str):
+                    stills.append({
+                        "input": str(item.get("input") or "unknown"),
+                        "url": url,
+                        "mediaType": "image",
+                        "capturedAt": captured,
+                        "triggerReason": item.get("triggerReason"),
+                    })
+            pagination = payload.get("pagination") or {}
+            if not pagination.get("hasNextPage") or not pagination.get("endCursor"):
+                break
+            params["after"] = pagination["endCursor"]
+        return stills
+
     async def retrieve_camera_snapshots(
         self, vehicle_id: str, event_time: datetime
     ) -> list[dict[str, Any]]:
@@ -410,6 +446,11 @@ class MockSamsaraClient:
         query_by_time_field: str = "updatedAtTime",
     ) -> SafetyStreamPage:
         return SafetyStreamPage([], "mock-safety-cursor", False)
+
+    async def get_camera_stills(
+        self, vehicle_id: str, start_time: datetime, end_time: datetime
+    ) -> list[dict[str, Any]]:
+        return []
 
     async def retrieve_camera_snapshots(
         self, vehicle_id: str, event_time: datetime

@@ -171,7 +171,13 @@ async def process_safety_event(
     timezone: str,
     integration_id: int | None = None,
     notification_delay_seconds: int = 90,
+    release_pending: bool = False,
 ) -> tuple[SafetyEvent, str]:
+    """Store a safety event and queue its alert.
+
+    release_pending: the media the alert was waiting for is now available, so
+    an initial alert that is still being held can go out immediately.
+    """
     existing = await session.scalar(
         select(SafetyEvent).where(SafetyEvent.samsara_event_id == event.samsara_event_id)
     )
@@ -257,6 +263,17 @@ async def process_safety_event(
             await queue_speed_update(
                 session, existing, safe_raw["speedingDetails"], integration_id
             )
+        if release_pending:
+            held = await session.scalar(
+                select(NotificationOutbox).where(
+                    NotificationOutbox.safety_event_id == existing.id,
+                    NotificationOutbox.notification_type == "new",
+                    NotificationOutbox.status == "pending",
+                    NotificationOutbox.next_attempt_at > now,
+                )
+            )
+            if held is not None:
+                held.next_attempt_at = now
         return existing, "updated" if changed else "unchanged"
 
     row = SafetyEvent(

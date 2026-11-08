@@ -29,6 +29,8 @@ SAFETY_OVERLAP = timedelta(minutes=30)
 SPEED_RECHECK_INTERVAL = timedelta(minutes=5)
 SPEED_RECHECK_MAX_AGE = timedelta(hours=12)
 MEDIA_PERMISSION_BACKOFF = timedelta(hours=1)
+SNAPSHOT_RECHECK_INTERVAL = timedelta(seconds=30)
+SNAPSHOT_LOOKBACK = timedelta(minutes=10)
 
 
 def _is_speeding(behaviors: list[str]) -> bool:
@@ -83,32 +85,103 @@ class SafetyMonitor:
             return
         logger.exception("safety_media_retrieval_failed event_id=%s", event_id)
 
+    @staticmethod
+    def _is_obstruction(behaviors: list[str]) -> bool:
+        labels = {label.replace(" ", "").lower() for label in behaviors}
+        return bool(labels & {"obstructedcamera", "cameraobstruction"})
+
+    @staticmethod
+    def _pick_still(stills: list[dict], event_time: datetime) -> tuple[list[dict], bool]:
+        """Pick the dashcam stills that best show the camera at event time.
+
+        Prefers the first capture at/after the event (it shows the obstruction),
+        otherwise the latest capture before it. Returns all camera inputs from
+        that capture (road + driver) and whether it was taken after the event.
+        """
+        by_time: dict[datetime, list[dict]] = {}
+        for still in stills:
+            captured = _parse_time(still.get("capturedAt"))
+            if captured:
+                by_time.setdefault(captured, []).append(still)
+        if not by_time:
+            return [], False
+        tolerance = timedelta(seconds=30)
+        after = sorted(t for t in by_time if t >= event_time - tolerance)
+        if after:
+            chosen, is_after = after[0], True
+        else:
+            chosen, is_after = max(by_time), False
+        order = {"dashcamRoadFacing": 0, "dashcamDriverFacing": 1}
+        group = sorted(by_time[chosen], key=lambda item: order.get(item["input"], 2))
+        return group, is_after
+
     async def _obstruction_snapshot(self, parsed):
-        labels = {label.replace(" ", "").lower() for label in parsed.behaviors}
-        if parsed.media or not parsed.vehicle_id or not (
-            labels & {"obstructedcamera", "cameraobstruction"}
+        """Attach the dashcam still showing the obstructed camera.
+
+        Returns (parsed, found_after_event). Uses stills Samsara already
+        uploaded, which only needs read access. Checks again on later polls
+        until a still taken after the event shows up.
+        """
+        if not parsed.vehicle_id or not self._is_obstruction(parsed.behaviors):
+            return parsed, False
+        if any(item.get("url") for item in parsed.media):
+            return parsed, True
+        key = f"safety_snapshot:{parsed.samsara_event_id}"
+        async with self.sessions() as session:
+            cached = await state_get(session, key)
+        stored = {}
+        if cached:
+            try:
+                stored = json.loads(cached) or {}
+            except (ValueError, TypeError):
+                stored = {}
+        now = datetime.now(UTC)
+        checked = _parse_time(stored.get("checkedAt"))
+        if not stored.get("afterEvent") and (
+            not checked or now - checked >= SNAPSHOT_RECHECK_INTERVAL
         ):
-            return parsed
-        if not self._media_allowed():
-            return parsed
-        key = f"safety_snapshot_requested:{parsed.samsara_event_id}"
-        async with self.sessions.begin() as session:
-            if await state_get(session, key):
-                return parsed
-            await state_set(session, key, datetime.now(UTC).isoformat())
-        try:
-            media = await self.client.retrieve_camera_snapshots(
-                parsed.vehicle_id, parsed.event_timestamp
-            )
-        except Exception as exc:
-            self._media_failed(exc, parsed.samsara_event_id)
-            return parsed
-        logger.info(
-            "safety_snapshot_retrieved event_id=%s media_urls=%d",
-            parsed.samsara_event_id,
-            len(media),
-        )
-        return replace(parsed, media=media) if media else parsed
+            try:
+                stills = await self.client.get_camera_stills(
+                    parsed.vehicle_id,
+                    parsed.event_timestamp - SNAPSHOT_LOOKBACK,
+                    min(
+                        now,
+                        parsed.event_timestamp
+                        + timedelta(seconds=self.settings.safety_snapshot_max_wait_seconds)
+                        + SNAPSHOT_LOOKBACK,
+                    ),
+                )
+            except Exception:
+                logger.exception(
+                    "safety_snapshot_lookup_failed event_id=%s", parsed.samsara_event_id
+                )
+                stills = []
+            media, is_after = self._pick_still(stills, parsed.event_timestamp)
+            if media:
+                stored = {"media": media, "afterEvent": is_after}
+                if is_after:
+                    logger.info(
+                        "safety_snapshot_found event_id=%s captured_at=%s inputs=%d",
+                        parsed.samsara_event_id,
+                        media[0]["capturedAt"],
+                        len(media),
+                    )
+            stored["checkedAt"] = now.isoformat()
+            async with self.sessions.begin() as session:
+                await state_set(session, key, json.dumps(stored))
+        media = stored.get("media") or []
+        if not media:
+            return parsed, False
+        raw = dict(parsed.raw)
+        raw["snapshotInfo"] = {
+            "capturedAt": media[0]["capturedAt"],
+            "afterEvent": bool(stored.get("afterEvent")),
+        }
+        clean = [
+            {"input": item["input"], "url": item["url"], "mediaType": "image"}
+            for item in media
+        ]
+        return replace(parsed, media=clean, raw=raw), bool(stored.get("afterEvent"))
 
     async def _speeding_details(
         self,
@@ -176,7 +249,11 @@ class SafetyMonitor:
         return replace(parsed, raw=raw)
 
     async def _speed_video(self, parsed):
-        if parsed.media or not parsed.vehicle_id or not _is_speeding(parsed.behaviors):
+        if (
+            any(item.get("url") for item in parsed.media)
+            or not parsed.vehicle_id
+            or not _is_speeding(parsed.behaviors)
+        ):
             return parsed
         if not self._media_allowed():
             return parsed
@@ -304,7 +381,17 @@ class SafetyMonitor:
                     parsed = parse_safety_event(raw)
                     if not parsed:
                         continue
-                    parsed = await self._obstruction_snapshot(parsed)
+                    parsed, snapshot_ready = await self._obstruction_snapshot(parsed)
+                    delay = self.settings.safety_notification_delay_seconds
+                    if self._is_obstruction(parsed.behaviors):
+                        # Hold the alert until the post-event still arrives,
+                        # at most safety_snapshot_max_wait_seconds after the event.
+                        deadline = parsed.event_timestamp + timedelta(
+                            seconds=self.settings.safety_snapshot_max_wait_seconds
+                        )
+                        delay = 0 if snapshot_ready else max(
+                            0, int((deadline - datetime.now(UTC)).total_seconds())
+                        )
                     parsed = await self._speed_enrichment(parsed)
                     parsed = await self._speed_video(parsed)
                     media_urls += sum(1 for item in parsed.media if item.get("url"))
@@ -322,9 +409,9 @@ class SafetyMonitor:
                         continue
                     if names & self.settings.ignored_safety_behaviors:
                         continue
-                    events.append(parsed)
+                    events.append((parsed, delay, snapshot_ready))
                 async with self.write_lock, self.sessions.begin() as session:
-                    for parsed in events:
+                    for parsed, delay, snapshot_ready in events:
                         _, result = await process_safety_event(
                             session,
                             parsed,
@@ -332,9 +419,8 @@ class SafetyMonitor:
                             send_initial=self.settings.send_initial_safety_events,
                             timezone=self.settings.timezone,
                             integration_id=self.integration_id,
-                            notification_delay_seconds=(
-                                self.settings.safety_notification_delay_seconds
-                            ),
+                            notification_delay_seconds=delay,
+                            release_pending=snapshot_ready,
                         )
                         totals["records"] += 1
                         if result in totals:

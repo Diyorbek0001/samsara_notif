@@ -28,6 +28,9 @@ class Settings(BaseSettings):
     samsara_fault_poll_seconds: int = Field(30, ge=5)
     safety_poll_seconds: int = Field(15, ge=5)
     safety_notification_delay_seconds: int = Field(90, ge=0, le=600)
+    # Obstructed-camera alerts wait for the next dashcam still (taken about
+    # every 6 minutes) so the alert shows what the camera actually sees.
+    safety_snapshot_max_wait_seconds: int = Field(480, ge=0, le=1800)
     samsara_request_timeout_seconds: float = Field(30, gt=0)
     samsara_max_retries: int = Field(5, ge=1, le=10)
     timezone: str = "America/New_York"
