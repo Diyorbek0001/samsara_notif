@@ -168,3 +168,22 @@ async def test_no_speed_update_for_alert_that_was_never_delivered(tmp_path) -> N
     async with sessions() as session:
         types = [r.notification_type for r in (await session.scalars(select(NotificationOutbox))).all()]
     assert types == ["new"]
+
+
+def test_alert_links_to_samsara_safety_inbox() -> None:
+    url = (
+        "https://cloud.samsara.com/o/7005121/fleet/safety/event_review"
+        "?aggregationUuid=abc&selectedAggregationKey=event"
+    )
+    event = SimpleNamespace(
+        severity="moderate", primary_behavior="ModerateSpeeding",
+        behavior_labels_json=["ModerateSpeeding"], alert_id="SAFE-1", driver=None,
+        vehicle=None, event_timestamp=datetime.now(UTC), location_name=None,
+        latitude=None, longitude=None, raw_event_json={"inboxEventUrl": url},
+        review_status="new", coaching_status="pending",
+    )
+    text = safety_message(event, "America/New_York")
+    assert '<a href="https://cloud.samsara.com/o/7005121/fleet/safety/event_review?aggregationUuid=abc&amp;selectedAggregationKey=event">Samsara Safety Inbox</a>' in text
+
+    event.raw_event_json = {"inboxEventUrl": "https://evil.example/phish"}
+    assert "Samsara Safety Inbox" not in safety_message(event, "America/New_York")

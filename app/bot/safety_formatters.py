@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import re
 from html import escape
+from urllib.parse import urlparse
 from zoneinfo import ZoneInfo
 
 from app.database.models import SafetyEvent
@@ -17,6 +18,20 @@ def _vehicle_name(event: SafetyEvent) -> str:
         or event.vehicle.vin
         or "Unknown"
     )
+
+
+def samsara_inbox_url(event: SafetyEvent) -> str | None:
+    """Samsara's own link to this event in the Safety Inbox, if present."""
+    raw = event.raw_event_json if isinstance(event.raw_event_json, dict) else {}
+    url = raw.get("inboxEventUrl")
+    if not isinstance(url, str):
+        return None
+    parsed = urlparse(url)
+    if parsed.scheme != "https" or not (
+        parsed.hostname == "samsara.com" or (parsed.hostname or "").endswith(".samsara.com")
+    ):
+        return None
+    return url
 
 
 def behavior_label(label: str) -> str:
@@ -50,6 +65,9 @@ def safety_message(event: SafetyEvent, timezone: str, test: bool = False) -> str
     if event.latitude is not None and event.longitude is not None:
         maps = f"https://www.google.com/maps/search/?api=1&amp;query={event.latitude:.6f},{event.longitude:.6f}"
         lines.append(f'🗺 <a href="{maps}">Google Maps</a>')
+    inbox = samsara_inbox_url(event)
+    if inbox:
+        lines.append(f'🔗 <a href="{escape(inbox, quote=True)}">Samsara Safety Inbox</a>')
     speed = (
         event.raw_event_json.get("speedingDetails")
         if isinstance(event.raw_event_json, dict)
