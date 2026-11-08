@@ -146,3 +146,25 @@ async def test_recheck_adds_posted_limit_after_trip_ends(tmp_path) -> None:
         assert row.raw_event_json["speedingDetails"]["postedSpeedLimitMph"] == 65.0
         types = [r.notification_type for r in (await session.scalars(select(NotificationOutbox))).all()]
     assert types == ["new", "speed_update"]
+
+
+async def test_no_speed_update_for_alert_that_was_never_delivered(tmp_path) -> None:
+    client = FakeClient([[], [_raw_event("dropped")]])
+    client.speeding = {"maxSpeedMph": 76.0}
+    monitor, sessions = await _monitor(tmp_path, client)
+    await monitor.poll_once()
+    await monitor.poll_once()
+    async with sessions.begin() as session:
+        initial = await session.scalar(select(NotificationOutbox))
+        initial.status = "dead"  # no activated group when it was due
+
+    client.speeding = {"maxSpeedMph": 76.0, "postedSpeedLimitMph": 65.0}
+    monitor._last_speed_recheck = None
+    from app.faults.service import state_set
+    async with sessions.begin() as session:
+        await state_set(session, "safety_speed_details:dropped", "")
+    await monitor.recheck_speed_limits()
+
+    async with sessions() as session:
+        types = [r.notification_type for r in (await session.scalars(select(NotificationOutbox))).all()]
+    assert types == ["new"]

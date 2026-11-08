@@ -120,17 +120,18 @@ async def queue_speed_update(
 ) -> bool:
     """Queue a follow-up alert when speeding details arrive after the first alert.
 
-    If the first alert has not been sent yet it will read the new details from
-    the database at send time, so no follow-up is needed.
+    Only follow up on alerts that were actually delivered. If the first alert
+    is still pending it reads the new details at send time; if it was never
+    sent (baseline, or no activated group) a follow-up would be confusing.
     """
-    unsent_initial = await session.scalar(
+    sent_initial = await session.scalar(
         select(NotificationOutbox.id).where(
             NotificationOutbox.safety_event_id == row.id,
             NotificationOutbox.notification_type == "new",
-            NotificationOutbox.status.in_(("pending", "failed", "processing")),
+            NotificationOutbox.status == "sent",
         )
     )
-    if unsent_initial is not None:
+    if sent_initial is None:
         return False
     speed_signature = hashlib.sha256(str(details).encode()).hexdigest()[:20]
     idempotency_key = f"safety:speed:{row.samsara_event_id}:{speed_signature}"
