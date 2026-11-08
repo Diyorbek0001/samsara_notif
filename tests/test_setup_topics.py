@@ -2,7 +2,7 @@ from datetime import UTC, datetime
 
 from aiogram import Bot
 from aiogram.client.session.base import BaseSession
-from aiogram.methods import AnswerCallbackQuery, CreateForumTopic, EditMessageText, SendMessage
+from aiogram.methods import AnswerCallbackQuery, CreateForumTopic, EditForumTopic, EditMessageText, SendMessage
 from aiogram.types import CallbackQuery, Chat, ForumTopic, Message, User
 from cryptography.fernet import Fernet
 from sqlalchemy import select
@@ -31,7 +31,7 @@ class FakeSession(BaseSession):
             return ForumTopic(message_thread_id=self.next_thread, name=method.name, icon_color=method.icon_color or 0)
         if isinstance(method, (SendMessage, EditMessageText)):
             return Message(message_id=900, date=datetime.now(UTC), chat=CHAT, text="ok")
-        if isinstance(method, AnswerCallbackQuery):
+        if isinstance(method, (AnswerCallbackQuery, EditForumTopic)):
             return True
         raise AssertionError(f"unexpected call {type(method).__name__}")
 
@@ -75,7 +75,9 @@ async def test_setup_topics_creates_three_routed_topics(tmp_path) -> None:
     await _handler(router, "setup_topics_callback")(callback)
 
     created = [c.name for c in fake.calls if isinstance(c, CreateForumTopic)]
-    assert created == ["🛠 Faults"] + [topic.title for topic in SAFETY_TOPICS]
+    assert created == ["🛠 Fault Codes"] + [topic.title for topic in SAFETY_TOPICS]
+    assert "👀 Distractions" in created
+    assert not {"📵 Phone Usage", "😴 Drowsiness"} & set(created)
     assert "🏎 Speeding" in created and "📷 Camera Obstruction" in created
     async with sessions() as session:
         routes = list((await session.scalars(select(TelegramRoute))).all())
@@ -91,4 +93,6 @@ async def test_setup_topics_creates_three_routed_topics(tmp_path) -> None:
     fake.calls.clear()
     await _handler(router, "setup_topics_callback")(callback)
     assert not [c for c in fake.calls if isinstance(c, CreateForumTopic)]
+    renamed = {c.message_thread_id: c.name for c in fake.calls if isinstance(c, EditForumTopic)}
+    assert renamed[501] == "🛠 Fault Codes"
     assert "already set up" in [c for c in fake.calls if isinstance(c, EditMessageText)][-1].text

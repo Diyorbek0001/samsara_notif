@@ -31,14 +31,12 @@ SAFETY_TOPICS: tuple[SafetyTopic, ...] = (
         "lightspeeding", "moderatespeeding", "heavyspeeding", "severespeeding",
         "maxspeed", "speeding",
     })),
-    SafetyTopic("phone", "📵 Phone Usage", _PINK, frozenset({"mobileusage"})),
     SafetyTopic("seatbelt", "🔒 Seatbelt", _YELLOW, frozenset({"noseatbelt"})),
     SafetyTopic("camera", "📷 Camera Obstruction", _PURPLE, frozenset({
         "obstructedcamera", "cameraobstruction",
     })),
-    SafetyTopic("drowsy", "😴 Drowsiness", _BLUE, frozenset({"drowsy"})),
-    SafetyTopic("distraction", "👀 Distraction", _PINK, frozenset({
-        "genericdistraction", "drinking", "eating", "smoking",
+    SafetyTopic("distraction", "👀 Distractions", _PINK, frozenset({
+        "genericdistraction", "mobileusage", "drowsy", "drinking", "eating", "smoking",
     })),
     SafetyTopic("following", "🚗 Following Distance", _YELLOW, frozenset({
         "generictailgating", "followingdistance", "tailgating",

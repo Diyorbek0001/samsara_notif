@@ -274,7 +274,7 @@ def build_admin_router(
         await callback.answer()
 
     # /setup_topics: a Faults topic plus one topic per safety alert type.
-    topic_plan = [("fault", "🛠 Faults", 0x6FB9F0)] + [
+    topic_plan = [("fault", "🛠 Fault Codes", 0x6FB9F0)] + [
         (topic.purpose, topic.title, topic.icon_color) for topic in SAFETY_TOPICS
     ]
     topic_purposes = {purpose for purpose, _, _ in topic_plan}
@@ -364,6 +364,14 @@ def build_admin_router(
         created: dict[str, int] = {}
         for purpose, title, color in topic_plan:
             if purpose in have:
+                # Keep existing topics (and their history) but apply the
+                # current name, e.g. "Faults" -> "Fault Codes".
+                try:
+                    await message.bot.edit_forum_topic(
+                        chat_id=chat_id, message_thread_id=have[purpose], name=title
+                    )
+                except Exception:
+                    pass  # already named this way, or not editable
                 continue
             try:
                 try:

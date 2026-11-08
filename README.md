@@ -101,10 +101,11 @@ its environment. Administrators manage them from Telegram:
 - `/removeSamsara <name>` disables an account and all of its routes.
 - `/activate` in a group or forum thread selects Fault codes, Safety alerts, or
   Both, then the Samsara account, using buttons.
-- `/setup_topics` in a forum group creates a Faults topic and one topic per
-  safety alert type (Speeding, Phone Usage, Seatbelt, Camera Obstruction,
-  Drowsiness, Distraction, Following Distance, Harsh Driving, Crash & Collision,
-  Traffic Violations, Other Safety) and routes each one. The mapping lives in
+- `/setup_topics` in a forum group creates a Fault Codes topic and one topic per
+  safety alert type (Speeding, Seatbelt, Camera Obstruction, Distractions
+  (including phone usage and drowsiness), Following Distance, Harsh Driving,
+  Crash & Collision, Traffic Violations, Other Safety) and routes each one.
+  Re-running it renames existing topics to the current names. The mapping lives in
   `app/safety/topics.py`. Older routes in the group are turned off so alerts are
   not duplicated.
 - `/deactivate` disables routes only in the exact group/thread where it is sent.

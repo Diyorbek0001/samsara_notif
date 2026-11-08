@@ -404,10 +404,10 @@ def test_each_alert_type_has_its_topic() -> None:
     from app.safety.topics import topic_for
     assert topic_for("LightSpeeding").key == "speeding"
     assert topic_for("SevereSpeeding").key == "speeding"
-    assert topic_for("MobileUsage").key == "phone"
+    assert topic_for("MobileUsage").key == "distraction"
     assert topic_for("NoSeatbelt").key == "seatbelt"
     assert topic_for("ObstructedCamera").key == "camera"
-    assert topic_for("Drowsy").key == "drowsy"
+    assert topic_for("Drowsy").key == "distraction"
     assert topic_for("Smoking").key == "distraction"
     assert topic_for("SomethingNew").key == "other"
 
@@ -425,7 +425,7 @@ async def test_safety_alert_goes_only_to_its_type_topic(tmp_path) -> None:
         account = SamsaraAccount(name="acb", encrypted_api_token="x", active=True, created_at=now, updated_at=now)
         session.add(account)
         await session.flush()
-        for purpose, thread in (("fault", 1), ("s:speeding", 2), ("s:phone", 3), ("s:other", 4)):
+        for purpose, thread in (("fault", 1), ("s:speeding", 2), ("s:distraction", 3), ("s:other", 4)):
             session.add(TelegramRoute(samsara_account_id=account.id, chat_id=-100, thread_id=thread,
                                       purpose=purpose, active=True, created_at=now, updated_at=now))
         await session.flush()
