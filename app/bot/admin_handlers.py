@@ -4,7 +4,7 @@ import asyncio
 from datetime import UTC, datetime
 
 from aiogram import F, Router
-from aiogram.exceptions import TelegramRetryAfter
+from aiogram.exceptions import TelegramBadRequest, TelegramRetryAfter
 from aiogram.filters import Command
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
@@ -365,14 +365,20 @@ def build_admin_router(
         for purpose, title, color in topic_plan:
             if purpose in have:
                 # Keep existing topics (and their history) but apply the
-                # current name, e.g. "Faults" -> "Fault Codes".
+                # current name, e.g. "Faults" -> "Fault Codes". Renaming also
+                # tells us whether the topic still exists.
                 try:
                     await message.bot.edit_forum_topic(
                         chat_id=chat_id, message_thread_id=have[purpose], name=title
                     )
+                    continue
+                except TelegramBadRequest as exc:
+                    if "not_modified" in str(exc).lower() or "not modified" in str(exc).lower():
+                        continue
+                    # Topic was deleted in Telegram: create it again below.
+                    del have[purpose]
                 except Exception:
-                    pass  # already named this way, or not editable
-                continue
+                    continue
             try:
                 try:
                     topic = await message.bot.create_forum_topic(

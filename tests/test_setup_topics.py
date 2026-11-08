@@ -2,6 +2,7 @@ from datetime import UTC, datetime
 
 from aiogram import Bot
 from aiogram.client.session.base import BaseSession
+from aiogram.exceptions import TelegramBadRequest
 from aiogram.methods import AnswerCallbackQuery, CreateForumTopic, EditForumTopic, EditMessageText, SendMessage
 from aiogram.types import CallbackQuery, Chat, ForumTopic, Message, User
 from cryptography.fernet import Fernet
@@ -23,6 +24,7 @@ class FakeSession(BaseSession):
         super().__init__()
         self.calls = []
         self.next_thread = 500
+        self.deleted: set[int] = set()
 
     async def make_request(self, bot, method, timeout=None):
         self.calls.append(method)
@@ -31,7 +33,11 @@ class FakeSession(BaseSession):
             return ForumTopic(message_thread_id=self.next_thread, name=method.name, icon_color=method.icon_color or 0)
         if isinstance(method, (SendMessage, EditMessageText)):
             return Message(message_id=900, date=datetime.now(UTC), chat=CHAT, text="ok")
-        if isinstance(method, (AnswerCallbackQuery, EditForumTopic)):
+        if isinstance(method, EditForumTopic):
+            if method.message_thread_id in self.deleted:
+                raise TelegramBadRequest(method=method, message="Bad Request: TOPIC_ID_INVALID")
+            return True
+        if isinstance(method, AnswerCallbackQuery):
             return True
         raise AssertionError(f"unexpected call {type(method).__name__}")
 
@@ -96,3 +102,35 @@ async def test_setup_topics_creates_three_routed_topics(tmp_path) -> None:
     renamed = {c.message_thread_id: c.name for c in fake.calls if isinstance(c, EditForumTopic)}
     assert renamed[501] == "🛠 Fault Codes"
     assert "already set up" in [c for c in fake.calls if isinstance(c, EditMessageText)][-1].text
+
+
+async def test_setup_topics_recreates_topics_deleted_in_telegram(tmp_path) -> None:
+    settings = Settings(token_encryption_key=Fernet.generate_key().decode(), admin_telegram_ids="111")
+    engine, sessions = create_database(f"sqlite+aiosqlite:///{tmp_path / 't.db'}")
+    await create_tables(engine)
+    now = datetime.now(UTC)
+    async with sessions.begin() as session:
+        account = SamsaraAccount(name="acb", encrypted_api_token="x", active=True, created_at=now, updated_at=now)
+        session.add(account)
+        await session.flush()
+        account_id = account.id
+    fake = FakeSession()
+    bot = Bot("123:abc", session=fake)
+    router = build_admin_router(settings, sessions)
+    admin = User(id=111, is_bot=False, first_name="Admin")
+    callback = CallbackQuery(id="1", from_user=admin, chat_instance="c",
+                             message=Message(message_id=10, date=now, chat=CHAT, text="pick").as_(bot),
+                             data=f"topics:{account_id}").as_(bot)
+    await _handler(router, "setup_topics_callback")(callback)
+    first_count = len(SAFETY_TOPICS) + 1
+
+    fake.deleted = set(range(501, 501 + first_count))  # user deleted every topic
+    fake.calls.clear()
+    await _handler(router, "setup_topics_callback")(callback)
+
+    assert len([c for c in fake.calls if isinstance(c, CreateForumTopic)]) == first_count
+    async with sessions() as session:
+        routes = list((await session.scalars(select(TelegramRoute))).all())
+    active = [r.thread_id for r in routes if r.active]
+    assert len(active) == first_count and min(active) > 500 + first_count
+    assert len([r for r in routes if not r.active]) == first_count
