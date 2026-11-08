@@ -398,3 +398,47 @@ async def test_speed_update_for_older_alert_replies_without_edit(tmp_path) -> No
     assert update["reply_to_message_id"] == original_id
     assert update["text"].startswith("🔄 <b>Speeding details update</b>")
     assert "Review status" not in update["text"]
+
+
+def test_each_alert_type_has_its_topic() -> None:
+    from app.safety.topics import topic_for
+    assert topic_for("LightSpeeding").key == "speeding"
+    assert topic_for("SevereSpeeding").key == "speeding"
+    assert topic_for("MobileUsage").key == "phone"
+    assert topic_for("NoSeatbelt").key == "seatbelt"
+    assert topic_for("ObstructedCamera").key == "camera"
+    assert topic_for("Drowsy").key == "drowsy"
+    assert topic_for("Smoking").key == "distraction"
+    assert topic_for("SomethingNew").key == "other"
+
+
+async def test_safety_alert_goes_only_to_its_type_topic(tmp_path) -> None:
+    from cryptography.fernet import Fernet
+    from app.database.models import SamsaraAccount, TelegramRoute
+    from app.notifications.worker import OutboxWorker
+    from app.safety.service import process_safety_event
+
+    engine, sessions = create_database(f"sqlite+aiosqlite:///{tmp_path / 'route.db'}")
+    await create_tables(engine)
+    now = datetime.now(UTC)
+    async with sessions.begin() as session:
+        account = SamsaraAccount(name="acb", encrypted_api_token="x", active=True, created_at=now, updated_at=now)
+        session.add(account)
+        await session.flush()
+        for purpose, thread in (("fault", 1), ("s:speeding", 2), ("s:phone", 3), ("s:other", 4)):
+            session.add(TelegramRoute(samsara_account_id=account.id, chat_id=-100, thread_id=thread,
+                                      purpose=purpose, active=True, created_at=now, updated_at=now))
+        await session.flush()
+        for event_id, label in (("a", "HeavySpeeding"), ("b", "MobileUsage"), ("c", "UnsafeParking")):
+            await process_safety_event(session, parse_safety_event(_raw_event(event_id, label=label)),
+                                       initialization=False, send_initial=False, timezone="America/New_York",
+                                       integration_id=account.id, notification_delay_seconds=0)
+
+    bot = FakeBot()
+    await OutboxWorker(Settings(token_encryption_key=Fernet.generate_key().decode()), sessions, bot).send_pending_once()
+    sent = sorted((c[1]["message_thread_id"], c[1]["text"].split("\n")[0]) for c in bot.calls)
+    assert sent == [
+        (2, "<b>⚠️ HIGH ALERT: HEAVY SPEEDING</b>"),
+        (3, "<b>⚠️ MODERATE ALERT: MOBILE USAGE</b>"),
+        (4, "<b>⚠️ LOW ALERT: UNSAFE PARKING</b>"),
+    ]

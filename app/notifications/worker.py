@@ -15,6 +15,7 @@ from sqlalchemy.orm import selectinload
 from app.bot.formatters import cleared_message, fault_message
 from app.bot.safety_formatters import safety_message, speed_update_message
 from app.config import Settings
+from app.safety.topics import topic_for
 from app.database.models import FaultIncident, NotificationLog, NotificationOutbox, SafetyEvent, TelegramRoute
 
 logger = logging.getLogger(__name__)
@@ -344,13 +345,19 @@ class OutboxWorker:
             integration_id = payload.get("integration_id")
             if not integration_id or payload.get("route_id"):
                 return
+            purposes = [item.category, "both", "all"]
+            if item.category == "safety" and item.safety_event_id:
+                # Per-type topics (speeding, phone usage, ...) from /setup_topics.
+                event = await session.get(SafetyEvent, item.safety_event_id)
+                if event is not None:
+                    purposes.append(topic_for(event.primary_behavior).purpose)
             routes = list(
                 (
                     await session.scalars(
                         select(TelegramRoute).where(
                             TelegramRoute.samsara_account_id == integration_id,
                             TelegramRoute.active.is_(True),
-                            TelegramRoute.purpose.in_((item.category, "both", "all")),
+                            TelegramRoute.purpose.in_(purposes),
                         ).order_by(TelegramRoute.id)
                     )
                 ).all()

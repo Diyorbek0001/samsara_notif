@@ -13,7 +13,6 @@ from sqlalchemy import func, select
 
 from app.bot.handlers import build_router
 from app.bot.admin_handlers import build_admin_router
-from app.bot.fuel_handlers import build_fuel_router
 from app.bot.safety_handlers import build_safety_router
 from app.config import Settings, get_settings
 from app.database.models import IntegrationState, NotificationOutbox
@@ -160,7 +159,6 @@ async def run(settings: Settings, monitor_only: bool = False) -> int:
         dp.include_router(build_admin_router(settings, sessions))
         dp.include_router(build_router(settings, sessions))
         dp.include_router(build_safety_router(settings, sessions))
-        dp.include_router(build_fuel_router(settings, sessions))
         outbox = OutboxWorker(settings, sessions, bot)
         tasks.extend([asyncio.create_task(outbox.run()), asyncio.create_task(dp.start_polling(bot))])
     try:

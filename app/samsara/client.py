@@ -375,15 +375,6 @@ class SamsaraClient:
             if not after:
                 raise SamsaraResponseError("Vehicle pagination omitted endCursor")
 
-    async def get_current_fuel_snapshot(self) -> list[dict[str, Any]]:
-        payload = await self._get(
-            "/fleet/vehicles/stats",
-            {"types": "gps,fuelPercents"},
-        )
-        data = payload.get("data")
-        if not isinstance(data, list):
-            raise SamsaraResponseError("Vehicle stats response omitted data")
-        return [item for item in data if isinstance(item, dict)]
 
     async def get_safety_event_stream(
         self,
@@ -432,9 +423,6 @@ class MockSamsaraClient:
         return FeedPage(payload["data"], pagination["endCursor"], pagination["hasNextPage"])
 
     async def get_vehicles(self) -> list[dict[str, Any]]:
-        return []
-
-    async def get_current_fuel_snapshot(self) -> list[dict[str, Any]]:
         return []
 
     async def get_safety_event_stream(

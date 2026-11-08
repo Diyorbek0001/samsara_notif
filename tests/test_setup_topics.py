@@ -11,6 +11,7 @@ from app.bot.admin_handlers import build_admin_router
 from app.config import Settings
 from app.database.models import SamsaraAccount, TelegramRoute
 from app.database.session import create_database, create_tables
+from app.safety.topics import SAFETY_TOPICS
 
 CHAT = Chat(id=-1001, type="supergroup", title="Fleet A", is_forum=True)
 
@@ -74,11 +75,14 @@ async def test_setup_topics_creates_three_routed_topics(tmp_path) -> None:
     await _handler(router, "setup_topics_callback")(callback)
 
     created = [c.name for c in fake.calls if isinstance(c, CreateForumTopic)]
-    assert created == ["🛠 Faults", "⚠️ Safety", "⛽ Fuel"]
+    assert created == ["🛠 Faults"] + [topic.title for topic in SAFETY_TOPICS]
+    assert "🏎 Speeding" in created and "📷 Camera Obstruction" in created
     async with sessions() as session:
         routes = list((await session.scalars(select(TelegramRoute))).all())
-    active = sorted((r.purpose, r.thread_id) for r in routes if r.active)
-    assert active == [("fault", 501), ("fuel", 503), ("safety", 502)]
+    active = {r.purpose: r.thread_id for r in routes if r.active}
+    assert active["fault"] == 501
+    assert active["s:speeding"] == 502
+    assert set(active) == {"fault"} | {topic.purpose for topic in SAFETY_TOPICS}
     assert [r.purpose for r in routes if not r.active] == ["all"]
     summary = [c for c in fake.calls if isinstance(c, EditMessageText)][-1].text
     assert "Turned off 1 older route" in summary

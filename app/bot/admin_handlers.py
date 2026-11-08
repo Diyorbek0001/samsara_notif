@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import asyncio
 from datetime import UTC, datetime
 
 from aiogram import F, Router
+from aiogram.exceptions import TelegramRetryAfter
 from aiogram.filters import Command
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
@@ -12,6 +14,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from app.config import Settings
 from app.database.models import SamsaraAccount, TelegramRoute
+from app.safety.topics import OTHER, SAFETY_TOPICS
 from app.samsara.client import SamsaraClient
 from app.security import TokenCipher
 
@@ -48,14 +51,13 @@ def build_admin_router(
             "/removeSamsara &lt;name&gt; — disable an account and its routes\n"
             "/samsaras — list configured Samsara accounts\n\n"
             "<b>Group or exact forum thread</b>\n"
-            "/activate — route fault codes, safety alerts, fuel notifications, or all\n"
+            "/activate — route fault codes, safety alerts, or both to this exact thread\n"
             "/deactivate — disable routes only in this exact group/thread\n"
-            "/setup_topics — create Faults, Safety and Fuel topics in this group\n\n"
+            "/setup_topics — create a Faults topic and one topic per safety alert type\n\n"
             "<b>Information and testing</b>\n"
             "/help — show this admin command list\n"
             "/fault_help — show fault lookup commands\n"
             "/safety — show recent safety alerts\n"
-            "/currentfuel — show current fuel, sorted low to high\n"
             "/safety_test — test safety-message delivery\n"
             "/fault_test — test fault-message delivery",
             parse_mode="HTML",
@@ -160,9 +162,8 @@ def build_admin_router(
     purpose_labels = {
         "fault": "Fault codes",
         "safety": "Safety alerts",
-        "fuel": "Fuel notifications",
         "both": "Both",
-        "all": "All",
+        "all": "All",  # legacy routes; no longer offered as a button
     }
 
     def callback_admin(callback: CallbackQuery) -> bool:
@@ -183,11 +184,7 @@ def build_admin_router(
                     InlineKeyboardButton(text=purpose_labels["fault"], callback_data="activate:p:fault"),
                     InlineKeyboardButton(text=purpose_labels["safety"], callback_data="activate:p:safety"),
                 ],
-                [
-                    InlineKeyboardButton(text=purpose_labels["fuel"], callback_data="activate:p:fuel"),
-                    InlineKeyboardButton(text=purpose_labels["both"], callback_data="activate:p:both"),
-                ],
-                [InlineKeyboardButton(text=purpose_labels["all"], callback_data="activate:p:all")],
+                [InlineKeyboardButton(text=purpose_labels["both"], callback_data="activate:p:both")],
                 [InlineKeyboardButton(text="Cancel", callback_data="activate:cancel")],
             ]
         )
@@ -276,17 +273,18 @@ def build_admin_router(
             return
         await callback.answer()
 
-    # /setup_topics: one forum topic per alert category in this group.
-    topic_plan = [
-        ("fault", "🛠 Faults", 0xFB6F5F),
-        ("safety", "⚠️ Safety", 0xFFD67E),
-        ("fuel", "⛽ Fuel", 0x6FB9F0),
+    # /setup_topics: a Faults topic plus one topic per safety alert type.
+    topic_plan = [("fault", "🛠 Faults", 0x6FB9F0)] + [
+        (topic.purpose, topic.title, topic.icon_color) for topic in SAFETY_TOPICS
     ]
-    topic_intro = {
-        "fault": "This topic receives fault code alerts for '{name}'.",
-        "safety": "This topic receives safety alerts for '{name}'.",
-        "fuel": "Fuel topic for '{name}'. Use /currentfuel here.",
-    }
+    topic_purposes = {purpose for purpose, _, _ in topic_plan}
+
+    def topic_intro(purpose: str, title: str, name: str) -> str:
+        if purpose == "fault":
+            return f"This topic receives fault code alerts for '{name}'."
+        if purpose == OTHER.purpose:
+            return f"This topic receives safety alerts for '{name}' that don't fit another topic."
+        return f"This topic receives {title.split(' ', 1)[1]} alerts for '{name}'."
 
     @router.message(Command("setup_topics", ignore_case=True))
     async def setup_topics_start(message: Message) -> None:
@@ -317,7 +315,7 @@ def build_admin_router(
         ]
         rows.append([InlineKeyboardButton(text="Cancel", callback_data="topics:cancel")])
         await message.answer(
-            "Create Faults, Safety and Fuel topics in this group for which Samsara account?",
+            f"Create {len(topic_plan)} topics (Faults + one per safety alert type) in this group for which Samsara account?",
             reply_markup=InlineKeyboardMarkup(inline_keyboard=rows),
         )
 
@@ -360,7 +358,7 @@ def build_admin_router(
         have = {
             route.purpose: route.thread_id
             for route in existing
-            if route.purpose in {"fault", "safety", "fuel"} and route.thread_id is not None
+            if route.purpose in topic_purposes and route.thread_id is not None
         }
         await callback.answer("Setting up topics…")
         created: dict[str, int] = {}
@@ -368,9 +366,16 @@ def build_admin_router(
             if purpose in have:
                 continue
             try:
-                topic = await message.bot.create_forum_topic(
-                    chat_id=chat_id, name=title, icon_color=color
-                )
+                try:
+                    topic = await message.bot.create_forum_topic(
+                        chat_id=chat_id, name=title, icon_color=color
+                    )
+                except TelegramRetryAfter as wait:
+                    # Creating many topics quickly can hit Telegram's flood limit.
+                    await asyncio.sleep(wait.retry_after + 1)
+                    topic = await message.bot.create_forum_topic(
+                        chat_id=chat_id, name=title, icon_color=color
+                    )
             except Exception as exc:
                 await message.edit_text(
                     f"Couldn't create the {title} topic ({type(exc).__name__}). "
@@ -419,16 +424,16 @@ def build_admin_router(
                 if route.active and route.thread_id not in threads.values():
                     route.active, route.updated_at = False, now
                     disabled += 1
+        names = {purpose: title for purpose, title, _ in topic_plan}
         for purpose, thread_id in created.items():
             try:
                 await message.bot.send_message(
                     chat_id=chat_id,
                     message_thread_id=thread_id,
-                    text=topic_intro[purpose].format(name=account_name),
+                    text=topic_intro(purpose, names[purpose], account_name),
                 )
             except Exception:
                 pass
-        names = {purpose: title for purpose, title, _ in topic_plan}
         lines = [f"Topics for '{account_name}':"]
         for purpose, _, _ in topic_plan:
             if purpose in threads:
