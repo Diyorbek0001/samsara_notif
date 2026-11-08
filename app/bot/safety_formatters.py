@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from html import escape
 from zoneinfo import ZoneInfo
 
@@ -18,19 +19,28 @@ def _vehicle_name(event: SafetyEvent) -> str:
     )
 
 
+def behavior_label(label: str) -> str:
+    """Turn Samsara labels like "LightSpeeding" into "Light Speeding"."""
+    return re.sub(r"(?<=[a-z])(?=[A-Z])", " ", label).strip()
+
+
 def safety_message(event: SafetyEvent, timezone: str, test: bool = False) -> str:
     title = (
         "🧪 TEST — NOT A REAL FLEET ALERT"
         if test
-        else f"⚠️ {event.severity.upper()} ALERT: {event.primary_behavior.upper()}"
+        else (
+            f"⚠️ {event.severity.upper()} ALERT: {behavior_label(event.primary_behavior).upper()}"
+            if event.severity != "unknown"
+            else f"⚠️ SAFETY ALERT: {behavior_label(event.primary_behavior).upper()}"
+        )
     )
     lines = [
         f"<b>{escape(title)}</b>",
         "",
         f"<b>Alert ID:</b> {escape(event.alert_id)}",
-        f"<b>Driver:</b> {escape(event.driver.driver_name if event.driver and event.driver.driver_name else 'Unknown')}",
+        f"<b>Driver:</b> {escape(event.driver.driver_name if event.driver and event.driver.driver_name else 'Unassigned')}",
         f"<b>Vehicle:</b> {escape(_vehicle_name(event))}",
-        f"<b>Behavior:</b> {escape(', '.join(event.behavior_labels_json) or event.primary_behavior)}",
+        f"<b>Behavior:</b> {escape(', '.join(behavior_label(label) for label in event.behavior_labels_json) or behavior_label(event.primary_behavior))}",
         f"<b>Severity:</b> {escape(event.severity.title())}",
         "",
         f"🕒 {escape(event.event_timestamp.astimezone(ZoneInfo(timezone)).strftime('%B %d, %Y — %I:%M %p %Z'))}",

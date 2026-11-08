@@ -24,9 +24,12 @@ class FaultMonitor:
         sessions: async_sessionmaker[AsyncSession],
         client: SamsaraClient | MockSamsaraClient,
         integration_id: int | None = None,
+        write_lock: asyncio.Lock | None = None,
     ):
         self.settings, self.sessions, self.client = settings, sessions, client
         self.integration_id = integration_id
+        # Shared with this account's SafetyMonitor; see SafetyMonitor.write_lock.
+        self.write_lock = write_lock or asyncio.Lock()
         self._stop = asyncio.Event()
         self._cycle_lock = asyncio.Lock()
 
@@ -41,7 +44,7 @@ class FaultMonitor:
             after = cursor
             while True:
                 page = await self.client.get_fault_code_feed(after)
-                async with self.sessions.begin() as session:
+                async with self.write_lock, self.sessions.begin() as session:
                     for vehicle_payload in page.data:
                         if not isinstance(vehicle_payload, dict):
                             continue

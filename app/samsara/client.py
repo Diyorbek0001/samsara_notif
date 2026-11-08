@@ -217,9 +217,18 @@ class SamsaraClient:
         return []
 
     async def get_speeding_details(
-        self, vehicle_id: str, event_time: datetime
+        self,
+        vehicle_id: str,
+        event_time: datetime,
+        trip_start: datetime | None = None,
     ) -> dict[str, Any] | None:
-        start = (event_time - timedelta(hours=2)).astimezone(UTC)
+        # Speeding intervals are queried by trip start. Samsara includes the
+        # event's tripStartTime, which also covers trips longer than two hours.
+        start = (
+            trip_start - timedelta(minutes=1)
+            if trip_start is not None and trip_start <= event_time
+            else event_time - timedelta(hours=2)
+        ).astimezone(UTC)
         end = (event_time + timedelta(hours=2)).astimezone(UTC)
         now = datetime.now(UTC)
         if end > now:
@@ -413,6 +422,9 @@ class MockSamsaraClient:
         return []
 
     async def get_speeding_details(
-        self, vehicle_id: str, event_time: datetime
+        self,
+        vehicle_id: str,
+        event_time: datetime,
+        trip_start: datetime | None = None,
     ) -> dict[str, Any] | None:
         return None

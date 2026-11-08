@@ -112,6 +112,55 @@ async def _driver(session: AsyncSession, event: NormalizedSafetyEvent) -> Driver
     return driver
 
 
+async def queue_speed_update(
+    session: AsyncSession,
+    row: SafetyEvent,
+    details: dict,
+    integration_id: int | None,
+) -> bool:
+    """Queue a follow-up alert when speeding details arrive after the first alert.
+
+    If the first alert has not been sent yet it will read the new details from
+    the database at send time, so no follow-up is needed.
+    """
+    unsent_initial = await session.scalar(
+        select(NotificationOutbox.id).where(
+            NotificationOutbox.safety_event_id == row.id,
+            NotificationOutbox.notification_type == "new",
+            NotificationOutbox.status.in_(("pending", "failed", "processing")),
+        )
+    )
+    if unsent_initial is not None:
+        return False
+    speed_signature = hashlib.sha256(str(details).encode()).hexdigest()[:20]
+    idempotency_key = f"safety:speed:{row.samsara_event_id}:{speed_signature}"
+    if await session.scalar(
+        select(NotificationOutbox.id).where(
+            NotificationOutbox.idempotency_key == idempotency_key
+        )
+    ):
+        return False
+    now = utcnow()
+    session.add(
+        NotificationOutbox(
+            safety_event_id=row.id,
+            category="safety",
+            notification_type="speed_update",
+            idempotency_key=idempotency_key,
+            payload_json={
+                "safety_event_id": row.id,
+                "alert_id": row.alert_id,
+                "integration_id": integration_id,
+            },
+            status="pending",
+            attempt_count=0,
+            next_attempt_at=now,
+            created_at=now,
+        )
+    )
+    return True
+
+
 async def process_safety_event(
     session: AsyncSession,
     event: NormalizedSafetyEvent,
@@ -204,36 +253,9 @@ async def process_safety_event(
                     )
                 )
         if speed_details_changed:
-            unsent_initial = await session.scalar(
-                select(NotificationOutbox.id).where(
-                    NotificationOutbox.safety_event_id == existing.id,
-                    NotificationOutbox.notification_type == "new",
-                    NotificationOutbox.status.in_(("pending", "failed", "processing")),
-                )
+            await queue_speed_update(
+                session, existing, safe_raw["speedingDetails"], integration_id
             )
-            if unsent_initial is None:
-                speed_signature = hashlib.sha256(
-                    str(safe_raw["speedingDetails"]).encode()
-                ).hexdigest()[:20]
-                session.add(
-                    NotificationOutbox(
-                        safety_event_id=existing.id,
-                        category="safety",
-                        notification_type="speed_update",
-                        idempotency_key=(
-                            f"safety:speed:{event.samsara_event_id}:{speed_signature}"
-                        ),
-                        payload_json={
-                            "safety_event_id": existing.id,
-                            "alert_id": existing.alert_id,
-                            "integration_id": integration_id,
-                        },
-                        status="pending",
-                        attempt_count=0,
-                        next_attempt_at=now,
-                        created_at=now,
-                    )
-                )
         return existing, "updated" if changed else "unchanged"
 
     row = SafetyEvent(

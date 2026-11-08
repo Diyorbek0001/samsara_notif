@@ -8,9 +8,20 @@ from .safety_models import NormalizedSafetyEvent
 
 
 CRITICAL = {"crash", "harshimpact", "rolloverprotection"}
-HIGH = {"drowsy", "severespeeding", "forwardcollisionwarning", "nearcollison"}
+HIGH = {
+    "drowsy",
+    "severespeeding",
+    "heavyspeeding",
+    "forwardcollisionwarning",
+    "nearcollison",
+    "nearcollision",
+}
 MODERATE = {
+    "moderatespeeding",
     "mobileusage",
+    "drinking",
+    "eating",
+    "smoking",
     "genericdistraction",
     "braking",
     "acceleration",
@@ -20,7 +31,10 @@ MODERATE = {
     "followingdistance",
     "noseatbelt",
 }
-LOW = {"obstructedcamera"}
+LOW = {"obstructedcamera", "lightspeeding", "unsafeparking"}
+
+# Samsara sends driver {"id": "0"} when no driver is assigned to the trip.
+UNASSIGNED_DRIVER_IDS = {"0", ""}
 
 
 def severity_for(behaviors: list[str]) -> str:
@@ -122,7 +136,12 @@ def parse_safety_event(raw: dict[str, Any]) -> NormalizedSafetyEvent | None:
         vehicle_id=str(asset["id"]) if asset.get("id") is not None else None,
         vehicle_name=str(asset["name"]) if asset.get("name") else None,
         vehicle_vin=str(asset["vin"]) if asset.get("vin") else None,
-        driver_id=str(driver["id"]) if driver.get("id") is not None else None,
+        driver_id=(
+            str(driver["id"])
+            if driver.get("id") is not None
+            and str(driver["id"]) not in UNASSIGNED_DRIVER_IDS
+            else None
+        ),
         driver_name=str(driver["name"]) if driver.get("name") else None,
         severity=severity_for(behaviors),
         primary_behavior=primary,

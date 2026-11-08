@@ -34,8 +34,9 @@ class IntegrationManager:
             if account.id in self._running:
                 continue
             client = SamsaraClient(self.cipher.decrypt(account.encrypted_api_token), self.settings.samsara_base_url, self.settings.samsara_request_timeout_seconds, self.settings.samsara_max_retries)
-            fault = FaultMonitor(self.settings, self.sessions, client, account.id)
-            safety = SafetyMonitor(self.settings, self.sessions, client, account.id)
+            write_lock = asyncio.Lock()
+            fault = FaultMonitor(self.settings, self.sessions, client, account.id, write_lock)
+            safety = SafetyMonitor(self.settings, self.sessions, client, account.id, write_lock)
             tasks = [asyncio.create_task(fault.run()), asyncio.create_task(safety.run())]
             self._running[account.id] = (client, fault, safety, tasks)
             logger.info("samsara_account_started account_id=%d name=%s", account.id, account.name)

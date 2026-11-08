@@ -98,17 +98,24 @@ class OutboxWorker:
                 continue
             try:
                 if item.category == "safety":
-                    text = (
-                        "📹 <b>Camera media update</b>\n"
-                        f"<b>Alert ID:</b> {escape(safety_event.alert_id)}\n"
-                        f"<b>Vehicle:</b> "
-                        f"{escape(safety_event.vehicle.vehicle_name if safety_event.vehicle and safety_event.vehicle.vehicle_name else 'Unknown')}"
-                        if item.notification_type == "media_update"
-                        else safety_message(safety_event, self.settings.timezone)
-                    )
+                    if item.notification_type == "media_update":
+                        text = (
+                            "📹 <b>Camera media update</b>\n"
+                            f"<b>Alert ID:</b> {escape(safety_event.alert_id)}\n"
+                            f"<b>Vehicle:</b> "
+                            f"{escape(safety_event.vehicle.vehicle_name if safety_event.vehicle and safety_event.vehicle.vehicle_name else 'Unknown')}"
+                        )
+                    elif item.notification_type == "speed_update":
+                        text = (
+                            "🔄 <b>Speeding details update</b>\n\n"
+                            + safety_message(safety_event, self.settings.timezone)
+                        )
+                    else:
+                        text = safety_message(safety_event, self.settings.timezone)
                     safety_chat_id = route.chat_id
                     safety_topic_id = route.thread_id
-                    valid_media = [
+                    # A speed update only adds numbers; don't re-send the videos.
+                    valid_media = [] if item.notification_type == "speed_update" else [
                         media for media in safety_event.media_json
                         if isinstance(media, dict) and media.get("url")
                     ]
@@ -240,6 +247,14 @@ class OutboxWorker:
                 item.status = "dead"
                 item.last_error = "No active Telegram route for this Samsara account/category"
                 item.processing_at = None
+                logger.warning(
+                    "notification_dropped_no_route outbox_id=%d integration_id=%s "
+                    "category=%s type=%s hint=run /activate in the destination group",
+                    item.id,
+                    integration_id,
+                    item.category,
+                    item.notification_type,
+                )
                 return
             payload["route_id"] = routes[0].id
             item.payload_json = payload

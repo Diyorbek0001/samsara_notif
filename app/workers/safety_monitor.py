@@ -7,19 +7,42 @@ import logging
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from app.config import Settings
+from app.database.models import SafetyEvent
 from app.faults.service import state_get, state_set
-from app.safety.service import process_safety_event
+from app.safety.service import process_safety_event, queue_speed_update
 from app.samsara.client import MockSamsaraClient, SamsaraClient
+from app.samsara.exceptions import SamsaraAuthenticationError, SamsaraPermissionError
 from app.samsara.safety_parser import parse_safety_event
 
 logger = logging.getLogger(__name__)
 CURSOR_KEY = "samsara_safety_cursor"
 START_KEY = "samsara_safety_start_time"
 LAST_SUCCESS_KEY = "last_successful_safety_poll"
+INITIAL_START_KEY = "samsara_safety_initial_start"
 SAFETY_OVERLAP = timedelta(minutes=30)
+# Samsara publishes speeding intervals (with the posted limit) only after the
+# trip ends, so keep re-checking recent speeding events for a while.
+SPEED_RECHECK_INTERVAL = timedelta(minutes=5)
+SPEED_RECHECK_MAX_AGE = timedelta(hours=12)
+MEDIA_PERMISSION_BACKOFF = timedelta(hours=1)
+
+
+def _is_speeding(behaviors: list[str]) -> bool:
+    return any("speed" in label.replace(" ", "").lower() for label in behaviors)
+
+
+def _parse_time(value: object) -> datetime | None:
+    if not isinstance(value, str) or not value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return parsed if parsed.tzinfo else parsed.replace(tzinfo=UTC)
 
 
 class SafetyMonitor:
@@ -29,17 +52,44 @@ class SafetyMonitor:
         sessions: async_sessionmaker[AsyncSession],
         client: SamsaraClient | MockSamsaraClient,
         integration_id: int | None = None,
+        write_lock: asyncio.Lock | None = None,
     ):
         self.settings, self.sessions, self.client = settings, sessions, client
         self.integration_id = integration_id
+        # Shared with this account's FaultMonitor so both never write vehicle
+        # rows at the same time (concurrent inserts deadlocked in PostgreSQL).
+        self.write_lock = write_lock or asyncio.Lock()
         self._stop = asyncio.Event()
         self._cycle_lock = asyncio.Lock()
+        self._media_blocked_until: datetime | None = None
+        self._last_speed_recheck: datetime | None = None
+        self._suffix = f":{integration_id}" if integration_id else ""
+
+    def _media_allowed(self) -> bool:
+        return self._media_blocked_until is None or datetime.now(UTC) >= self._media_blocked_until
+
+    def _media_failed(self, exc: Exception, event_id: str) -> None:
+        if isinstance(exc, (SamsaraAuthenticationError, SamsaraPermissionError)):
+            # Read-only tokens get 401/403 here. Log once and pause instead of
+            # failing (with a traceback) on every camera event.
+            self._media_blocked_until = datetime.now(UTC) + MEDIA_PERMISSION_BACKOFF
+            logger.warning(
+                "camera_media_retrieval_unauthorized integration_id=%s "
+                "hint=the Samsara API token needs Read and Write Media Retrieval "
+                "paused_minutes=%d",
+                self.integration_id,
+                MEDIA_PERMISSION_BACKOFF.total_seconds() // 60,
+            )
+            return
+        logger.exception("safety_media_retrieval_failed event_id=%s", event_id)
 
     async def _obstruction_snapshot(self, parsed):
         labels = {label.replace(" ", "").lower() for label in parsed.behaviors}
         if parsed.media or not parsed.vehicle_id or not (
             labels & {"obstructedcamera", "cameraobstruction"}
         ):
+            return parsed
+        if not self._media_allowed():
             return parsed
         key = f"safety_snapshot_requested:{parsed.samsara_event_id}"
         async with self.sessions.begin() as session:
@@ -50,11 +100,8 @@ class SafetyMonitor:
             media = await self.client.retrieve_camera_snapshots(
                 parsed.vehicle_id, parsed.event_timestamp
             )
-        except Exception:
-            logger.exception(
-                "safety_snapshot_retrieval_failed event_id=%s",
-                parsed.samsara_event_id,
-            )
+        except Exception as exc:
+            self._media_failed(exc, parsed.samsara_event_id)
             return parsed
         logger.info(
             "safety_snapshot_retrieved event_id=%s media_urls=%d",
@@ -63,48 +110,65 @@ class SafetyMonitor:
         )
         return replace(parsed, media=media) if media else parsed
 
-    async def _speed_enrichment(self, parsed):
-        labels = {label.replace(" ", "").lower() for label in parsed.behaviors}
-        if not parsed.vehicle_id or not any("speed" in label for label in labels):
-            return parsed
-        key = f"safety_speed_details:{parsed.samsara_event_id}"
+    async def _speeding_details(
+        self,
+        event_id: str,
+        vehicle_id: str,
+        event_time: datetime,
+        trip_start: datetime | None,
+    ) -> dict | None:
+        """Return cached or freshly fetched speeding details for one event.
+
+        Details are final once they include the posted speed limit. Until then
+        Samsara is asked again at most every SPEED_RECHECK_INTERVAL.
+        """
+        key = f"safety_speed_details:{event_id}"
         async with self.sessions() as session:
             cached = await state_get(session, key)
         details = None
         if cached:
             try:
                 stored = json.loads(cached)
-                if isinstance(stored, dict) and stored.get("details"):
-                    details = stored["details"]
-                elif isinstance(stored, dict) and stored.get("checkedAt"):
-                    checked = datetime.fromisoformat(stored["checkedAt"])
-                    if datetime.now(UTC) - checked < timedelta(minutes=5):
-                        return parsed
             except (ValueError, TypeError):
-                pass
-        if details is None:
-            try:
-                details = await self.client.get_speeding_details(
-                    parsed.vehicle_id, parsed.event_timestamp
-                )
-            except Exception:
-                logger.exception(
-                    "safety_speed_enrichment_failed event_id=%s",
-                    parsed.samsara_event_id,
-                )
-                async with self.sessions.begin() as session:
-                    await state_set(
-                        session,
-                        key,
-                        json.dumps({"checkedAt": datetime.now(UTC).isoformat()}),
-                    )
-                return parsed
-            stored = {
-                "checkedAt": datetime.now(UTC).isoformat(),
-                "details": details,
-            }
-            async with self.sessions.begin() as session:
-                await state_set(session, key, json.dumps(stored))
+                stored = None
+            if isinstance(stored, dict):
+                details = stored.get("details") or None
+                if details and details.get("postedSpeedLimitMph") is not None:
+                    return details
+                checked = _parse_time(stored.get("checkedAt"))
+                if checked and datetime.now(UTC) - checked < SPEED_RECHECK_INTERVAL:
+                    return details
+        try:
+            fetched = await self.client.get_speeding_details(
+                vehicle_id, event_time, trip_start
+            )
+        except Exception:
+            logger.exception("safety_speed_enrichment_failed event_id=%s", event_id)
+            fetched = None
+        # Keep earlier partial details (max speed) if the new lookup found less.
+        if fetched and (
+            not details
+            or fetched.get("postedSpeedLimitMph") is not None
+            or details.get("postedSpeedLimitMph") is None
+        ):
+            details = fetched
+        async with self.sessions.begin() as session:
+            await state_set(
+                session,
+                key,
+                json.dumps({"checkedAt": datetime.now(UTC).isoformat(), "details": details}),
+            )
+        return details
+
+    async def _speed_enrichment(self, parsed):
+        if not parsed.vehicle_id or not _is_speeding(parsed.behaviors):
+            return parsed
+        details = await self._speeding_details(
+            parsed.samsara_event_id,
+            parsed.vehicle_id,
+            parsed.event_timestamp,
+            _parse_time(parsed.raw.get("tripStartTime")),
+        )
         if not details:
             return parsed
         raw = dict(parsed.raw)
@@ -112,10 +176,9 @@ class SafetyMonitor:
         return replace(parsed, raw=raw)
 
     async def _speed_video(self, parsed):
-        labels = {label.replace(" ", "").lower() for label in parsed.behaviors}
-        if parsed.media or not parsed.vehicle_id or not any(
-            "speed" in label for label in labels
-        ):
+        if parsed.media or not parsed.vehicle_id or not _is_speeding(parsed.behaviors):
+            return parsed
+        if not self._media_allowed():
             return parsed
         key = f"safety_speed_video_requested:{parsed.samsara_event_id}"
         async with self.sessions.begin() as session:
@@ -126,11 +189,13 @@ class SafetyMonitor:
             media = await self.client.retrieve_camera_video(
                 parsed.vehicle_id, parsed.event_timestamp
             )
-        except Exception:
-            logger.exception(
-                "safety_speed_video_retrieval_failed event_id=%s",
-                parsed.samsara_event_id,
-            )
+        except Exception as exc:
+            self._media_failed(exc, parsed.samsara_event_id)
+            if not self._media_allowed():
+                # Permission problem, not this event: allow a retry once the
+                # token is fixed and the pause ends.
+                async with self.sessions.begin() as session:
+                    await state_set(session, key, "")
             return parsed
         logger.info(
             "safety_speed_video_retrieved event_id=%s media_urls=%d",
@@ -139,27 +204,84 @@ class SafetyMonitor:
         )
         return replace(parsed, media=media) if media else parsed
 
+    async def recheck_speed_limits(self) -> int:
+        """Fill in posted speed limits for recent speeding events.
+
+        Events leave the live polling window after SAFETY_OVERLAP, but Samsara
+        only publishes the posted limit when the trip ends, which can be hours
+        later. This sweep looks those events up again and queues an update.
+        """
+        now = datetime.now(UTC)
+        if self._last_speed_recheck and now - self._last_speed_recheck < SPEED_RECHECK_INTERVAL:
+            return 0
+        self._last_speed_recheck = now
+        prefix = f"{self.integration_id}:" if self.integration_id else ""
+        async with self.sessions() as session:
+            query = select(SafetyEvent).where(
+                SafetyEvent.created_at >= now - SPEED_RECHECK_MAX_AGE,
+                SafetyEvent.primary_behavior.ilike("%speed%"),
+                # Baseline events were stored without alerting; don't alert now.
+                SafetyEvent.initialized_baseline.is_(False),
+            )
+            if prefix:
+                query = query.where(SafetyEvent.samsara_event_id.startswith(prefix))
+            rows = list((await session.scalars(query)).all())
+        updated = 0
+        for row in rows:
+            raw = row.raw_event_json if isinstance(row.raw_event_json, dict) else {}
+            current = raw.get("speedingDetails")
+            if isinstance(current, dict) and current.get("postedSpeedLimitMph") is not None:
+                continue
+            asset = raw.get("asset") if isinstance(raw.get("asset"), dict) else {}
+            vehicle_id = asset.get("id")
+            if not vehicle_id:
+                continue
+            raw_event_id = row.samsara_event_id.removeprefix(prefix)
+            event_time = row.event_timestamp
+            if event_time.tzinfo is None:
+                event_time = event_time.replace(tzinfo=UTC)
+            details = await self._speeding_details(
+                raw_event_id,
+                str(vehicle_id),
+                event_time,
+                _parse_time(raw.get("tripStartTime")),
+            )
+            if not details or details.get("postedSpeedLimitMph") is None:
+                continue
+            async with self.write_lock, self.sessions.begin() as session:
+                db_row = await session.get(SafetyEvent, row.id)
+                db_raw = dict(db_row.raw_event_json or {})
+                db_raw["speedingDetails"] = details
+                db_row.raw_event_json = db_raw
+                db_row.updated_at = datetime.now(UTC)
+                await queue_speed_update(session, db_row, details, self.integration_id)
+            updated += 1
+            logger.info("safety_speed_limit_backfilled alert_id=%s", row.alert_id)
+        return updated
+
     async def poll_once(self) -> dict[str, int]:
         totals = {"pages": 0, "records": 0, "created": 0, "updated": 0}
+        suffix = self._suffix
         async with self._cycle_lock:
             cycle_end = datetime.now(UTC)
             async with self.sessions() as session:
-                cursor = await state_get(session, CURSOR_KEY)
-                suffix = f":{self.integration_id}" if self.integration_id else ""
                 last_success = await state_get(session, LAST_SUCCESS_KEY + suffix)
-            initialization = last_success is None
-            if last_success:
-                try:
-                    last_poll = datetime.fromisoformat(last_success.replace("Z", "+00:00"))
-                    window_start = last_poll - SAFETY_OVERLAP
-                except ValueError:
-                    window_start = cycle_end - timedelta(
-                        minutes=self.settings.safety_initial_lookback_minutes
-                    )
-            else:
-                window_start = cycle_end - timedelta(
-                    minutes=self.settings.safety_initial_lookback_minutes
+                initial_start = _parse_time(
+                    await state_get(session, INITIAL_START_KEY + suffix)
                 )
+            initialization = last_success is None
+            window_start = cycle_end - timedelta(
+                minutes=self.settings.safety_initial_lookback_minutes
+            )
+            if last_success:
+                last_poll = _parse_time(last_success)
+                if last_poll:
+                    window_start = last_poll - SAFETY_OVERLAP
+                    # Never look further back than the first (baseline) poll.
+                    # Otherwise the second poll treats events from before the
+                    # baseline as new and alerts on them.
+                    if initial_start and window_start < initial_start:
+                        window_start = initial_start
             start = window_start.isoformat().replace("+00:00", "Z")
             end = cycle_end.isoformat().replace("+00:00", "Z")
             # Cursors are only valid within this bounded pagination pass. Starting
@@ -175,31 +297,34 @@ class SafetyMonitor:
                     # safety event. Poll updates so those later URLs are delivered.
                     query_by_time_field="updatedAtTime",
                 )
-                async with self.sessions.begin() as session:
-                    for raw in page.data:
-                        parsed = parse_safety_event(raw)
-                        if not parsed:
-                            continue
-                        parsed = await self._obstruction_snapshot(parsed)
-                        parsed = await self._speed_enrichment(parsed)
-                        parsed = await self._speed_video(parsed)
-                        media_urls += sum(
-                            1 for item in parsed.media if item.get("url")
+                # Enrich first (network calls), then write everything in one
+                # short transaction.
+                events = []
+                for raw in page.data:
+                    parsed = parse_safety_event(raw)
+                    if not parsed:
+                        continue
+                    parsed = await self._obstruction_snapshot(parsed)
+                    parsed = await self._speed_enrichment(parsed)
+                    parsed = await self._speed_video(parsed)
+                    media_urls += sum(1 for item in parsed.media if item.get("url"))
+                    if self.integration_id:
+                        parsed = replace(
+                            parsed,
+                            samsara_event_id=f"{self.integration_id}:{parsed.samsara_event_id}",
+                            vehicle_id=f"{self.integration_id}:{parsed.vehicle_id}" if parsed.vehicle_id else None,
+                            driver_id=f"{self.integration_id}:{parsed.driver_id}" if parsed.driver_id else None,
                         )
-                        if self.integration_id:
-                            parsed = replace(
-                                parsed,
-                                samsara_event_id=f"{self.integration_id}:{parsed.samsara_event_id}",
-                                vehicle_id=f"{self.integration_id}:{parsed.vehicle_id}" if parsed.vehicle_id else None,
-                                driver_id=f"{self.integration_id}:{parsed.driver_id}" if parsed.driver_id else None,
-                            )
-                        names = {name.lower() for name in parsed.behaviors}
-                        if self.settings.allowed_safety_behaviors and not (
-                            names & self.settings.allowed_safety_behaviors
-                        ):
-                            continue
-                        if names & self.settings.ignored_safety_behaviors:
-                            continue
+                    names = {name.lower() for name in parsed.behaviors}
+                    if self.settings.allowed_safety_behaviors and not (
+                        names & self.settings.allowed_safety_behaviors
+                    ):
+                        continue
+                    if names & self.settings.ignored_safety_behaviors:
+                        continue
+                    events.append(parsed)
+                async with self.write_lock, self.sessions.begin() as session:
+                    for parsed in events:
                         _, result = await process_safety_event(
                             session,
                             parsed,
@@ -214,8 +339,10 @@ class SafetyMonitor:
                         totals["records"] += 1
                         if result in totals:
                             totals[result] += 1
-                    await state_set(session, START_KEY, start)
-                    await state_set(session, CURSOR_KEY, page.end_cursor)
+                    if initialization and totals["pages"] == 0:
+                        await state_set(session, INITIAL_START_KEY + suffix, start)
+                    await state_set(session, START_KEY + suffix, start)
+                    await state_set(session, CURSOR_KEY + suffix, page.end_cursor)
                     await state_set(session, LAST_SUCCESS_KEY + suffix, cycle_end.isoformat())
                 totals["pages"] += 1
                 logger.info(
@@ -232,7 +359,12 @@ class SafetyMonitor:
                 after = page.end_cursor
                 initialization = False
                 if not page.has_next_page:
-                    return totals
+                    break
+        try:
+            await self.recheck_speed_limits()
+        except Exception:
+            logger.exception("safety_speed_recheck_failed")
+        return totals
 
     async def run(self) -> None:
         logger.info("safety_monitor_started")

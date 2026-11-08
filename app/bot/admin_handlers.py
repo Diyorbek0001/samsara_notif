@@ -2,11 +2,11 @@ from __future__ import annotations
 
 from datetime import UTC, datetime
 
-from aiogram import Router
+from aiogram import F, Router
 from aiogram.filters import Command
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
-from aiogram.types import KeyboardButton, Message, ReplyKeyboardMarkup, ReplyKeyboardRemove
+from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
@@ -19,11 +19,6 @@ from app.security import TokenCipher
 class AddSamsara(StatesGroup):
     name = State()
     token = State()
-
-
-class ActivateRoute(StatesGroup):
-    purpose = State()
-    account = State()
 
 
 def build_admin_router(
@@ -159,65 +154,126 @@ def build_admin_router(
                 route.active = False
         await message.answer(f"Samsara account '{row.name}' and its routes were disabled.")
 
+    # /activate uses inline buttons. Button taps (callback queries) reach the
+    # bot even when its group privacy mode is on; typed replies do not.
+    purpose_labels = {
+        "fault": "Fault codes",
+        "safety": "Safety alerts",
+        "fuel": "Fuel notifications",
+        "both": "Both",
+        "all": "All",
+    }
+
+    def callback_admin(callback: CallbackQuery) -> bool:
+        user = callback.from_user
+        return bool(user) and settings.is_admin(user.id, user.username)
+
+    def route_thread_id(message: Message) -> int | None:
+        return message.message_thread_id if message.is_topic_message else None
+
     @router.message(Command("activate", ignore_case=True))
-    async def activate_start(message: Message, state: FSMContext) -> None:
+    async def activate_start(message: Message) -> None:
         if message.chat.type not in {"group", "supergroup"} or not admin(message):
             await message.answer("Admin-only command. Use it in the destination group/thread.")
             return
-        await state.update_data(chat_id=message.chat.id, thread_id=message.message_thread_id, chat_title=message.chat.title)
-        await state.set_state(ActivateRoute.purpose)
-        await message.answer(
-            "Choose what this exact group/thread receives:",
-            reply_markup=ReplyKeyboardMarkup(
-                keyboard=[
-                    [KeyboardButton(text="Fault codes"), KeyboardButton(text="Safety alerts")],
-                    [KeyboardButton(text="Fuel notifications"), KeyboardButton(text="Both")],
-                    [KeyboardButton(text="All")],
+        keyboard = InlineKeyboardMarkup(
+            inline_keyboard=[
+                [
+                    InlineKeyboardButton(text=purpose_labels["fault"], callback_data="activate:p:fault"),
+                    InlineKeyboardButton(text=purpose_labels["safety"], callback_data="activate:p:safety"),
                 ],
-                resize_keyboard=True,
-                one_time_keyboard=True,
-            ),
+                [
+                    InlineKeyboardButton(text=purpose_labels["fuel"], callback_data="activate:p:fuel"),
+                    InlineKeyboardButton(text=purpose_labels["both"], callback_data="activate:p:both"),
+                ],
+                [InlineKeyboardButton(text=purpose_labels["all"], callback_data="activate:p:all")],
+                [InlineKeyboardButton(text="Cancel", callback_data="activate:cancel")],
+            ]
         )
+        await message.answer("Choose what this exact group/thread receives:", reply_markup=keyboard)
 
-    @router.message(ActivateRoute.purpose)
-    async def activate_purpose(message: Message, state: FSMContext) -> None:
-        choices = {
-            "fault codes": "fault",
-            "safety alerts": "safety",
-            "fuel notifications": "fuel",
-            "both": "both",
-            "all": "all",
-        }
-        purpose = choices.get((message.text or "").strip().lower())
-        if not purpose:
-            await message.answer("Choose Fault codes, Safety alerts, Fuel notifications, Both, or All.")
+    @router.callback_query(F.data.startswith("activate:"))
+    async def activate_callback(callback: CallbackQuery) -> None:
+        message = callback.message
+        if not isinstance(message, Message) or message.chat.type not in {"group", "supergroup"}:
+            await callback.answer()
             return
-        await state.update_data(purpose=purpose)
-        await state.set_state(ActivateRoute.account)
-        await message.answer("Send the custom Samsara account name.", reply_markup=ReplyKeyboardRemove())
-
-    @router.message(ActivateRoute.account)
-    async def activate_account(message: Message, state: FSMContext) -> None:
-        data = await state.get_data()
-        async with sessions.begin() as session:
-            account = await account_named(session, (message.text or "").strip())
-            if not account or not account.active:
-                await message.answer("Active Samsara account not found. Try again.")
-                return
-            route = await session.scalar(
-                select(TelegramRoute).where(
-                    TelegramRoute.samsara_account_id == account.id,
-                    TelegramRoute.chat_id == data["chat_id"],
-                    TelegramRoute.thread_id == data["thread_id"],
+        if not callback_admin(callback):
+            await callback.answer("Admin-only.", show_alert=True)
+            return
+        parts = (callback.data or "").split(":")
+        if parts[1:2] == ["cancel"]:
+            await message.edit_text("Activation cancelled.")
+            await callback.answer()
+            return
+        if len(parts) == 3 and parts[1] == "p" and parts[2] in purpose_labels:
+            purpose = parts[2]
+            async with sessions() as session:
+                accounts = list(
+                    (
+                        await session.scalars(
+                            select(SamsaraAccount)
+                            .where(SamsaraAccount.active.is_(True))
+                            .order_by(SamsaraAccount.name)
+                        )
+                    ).all()
                 )
+            if not accounts:
+                await message.edit_text("No active Samsara accounts. Add one with /addSamsara in private chat.")
+                await callback.answer()
+                return
+            rows = [
+                [InlineKeyboardButton(text=account.name, callback_data=f"activate:a:{purpose}:{account.id}")]
+                for account in accounts[:50]
+            ]
+            rows.append([InlineKeyboardButton(text="Cancel", callback_data="activate:cancel")])
+            await message.edit_text(
+                f"{purpose_labels[purpose]} — choose the Samsara account:",
+                reply_markup=InlineKeyboardMarkup(inline_keyboard=rows),
             )
-            now = datetime.now(UTC)
-            if route:
-                route.purpose, route.active, route.updated_at = data["purpose"], True, now
-            else:
-                session.add(TelegramRoute(samsara_account_id=account.id, chat_id=data["chat_id"], thread_id=data["thread_id"], chat_title=data.get("chat_title"), purpose=data["purpose"], active=True, created_by_telegram_id=message.from_user.id if message.from_user else None, created_at=now, updated_at=now))
-        await state.clear()
-        await message.answer(f"Activated {data['purpose']} for '{account.name}' in this exact thread.")
+            await callback.answer()
+            return
+        if len(parts) == 4 and parts[1] == "a" and parts[2] in purpose_labels and parts[3].isdigit():
+            purpose, account_id = parts[2], int(parts[3])
+            chat_id, thread_id = message.chat.id, route_thread_id(message)
+            async with sessions.begin() as session:
+                account = await session.get(SamsaraAccount, account_id)
+                if not account or not account.active:
+                    await callback.answer("That Samsara account is no longer active.", show_alert=True)
+                    return
+                route = await session.scalar(
+                    select(TelegramRoute).where(
+                        TelegramRoute.samsara_account_id == account.id,
+                        TelegramRoute.chat_id == chat_id,
+                        TelegramRoute.thread_id == thread_id
+                        if thread_id is not None
+                        else TelegramRoute.thread_id.is_(None),
+                    )
+                )
+                now = datetime.now(UTC)
+                if route:
+                    route.purpose, route.active, route.updated_at = purpose, True, now
+                else:
+                    session.add(
+                        TelegramRoute(
+                            samsara_account_id=account.id,
+                            chat_id=chat_id,
+                            thread_id=thread_id,
+                            chat_title=message.chat.title,
+                            purpose=purpose,
+                            active=True,
+                            created_by_telegram_id=callback.from_user.id,
+                            created_at=now,
+                            updated_at=now,
+                        )
+                    )
+                account_name = account.name
+            await message.edit_text(
+                f"Activated {purpose_labels[purpose]} for '{account_name}' in this exact thread."
+            )
+            await callback.answer("Activated.")
+            return
+        await callback.answer()
 
     @router.message(Command("deactivate", ignore_case=True))
     async def deactivate(message: Message) -> None:
