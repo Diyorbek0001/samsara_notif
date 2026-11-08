@@ -6,6 +6,7 @@ from datetime import UTC, datetime, timedelta
 from html import escape
 
 from aiogram import Bot
+from aiogram.exceptions import TelegramBadRequest
 from aiogram.types import InputMediaPhoto, InputMediaVideo
 from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
@@ -96,6 +97,13 @@ class OutboxWorker:
                     dead=True,
                 )
                 continue
+            if (
+                item.category == "safety"
+                and item.notification_type == "speed_update"
+                and await self._edit_original_alert(item_id, safety_event, route)
+            ):
+                continue
+            sent_as = "text"
             try:
                 if item.category == "safety":
                     if item.notification_type == "media_update":
@@ -132,6 +140,7 @@ class OutboxWorker:
                                     parse_mode="HTML",
                                     reply_markup=None,
                                 )
+                                sent_as = "caption"
                             else:
                                 message = await self.bot.send_video(
                                     chat_id=safety_chat_id,
@@ -141,6 +150,7 @@ class OutboxWorker:
                                     parse_mode="HTML",
                                     reply_markup=None,
                                 )
+                                sent_as = "caption"
                         except Exception:
                             logger.warning("safety_media_send_failed alert_id=%s", safety_event.alert_id)
                     elif len(valid_media) > 1:
@@ -158,6 +168,7 @@ class OutboxWorker:
                                 ],
                             )
                             message = messages[0]
+                            sent_as = "caption"
                         except Exception:
                             logger.warning("safety_media_group_send_failed alert_id=%s", safety_event.alert_id)
                     if message is None:
@@ -198,6 +209,14 @@ class OutboxWorker:
                     None,
                     None,
                 )
+                # Kept so later updates (posted speed limit) can edit this
+                # exact message instead of sending a new one.
+                row.payload_json = {
+                    **(row.payload_json or {}),
+                    "sent_chat_id": message.chat.id,
+                    "sent_message_id": message.message_id,
+                    "sent_as": sent_as,
+                }
                 if db_incident and item.notification_type != "cleared" and not db_incident.telegram_message_id:
                     db_incident.telegram_chat_id = message.chat.id
                     db_incident.telegram_topic_id = fault_topic_id
@@ -224,6 +243,77 @@ class OutboxWorker:
                 )
             sent += 1
         return sent
+
+    async def _edit_original_alert(
+        self, item_id: int, safety_event: SafetyEvent, route: TelegramRoute
+    ) -> bool:
+        """Apply a speeding update by editing the alert already in the chat.
+
+        Returns False when there is no editable original (sent before message
+        references were stored, or deleted); the caller then sends a new
+        message instead.
+        """
+        async with self.sessions() as session:
+            originals = list(
+                (
+                    await session.scalars(
+                        select(NotificationOutbox).where(
+                            NotificationOutbox.safety_event_id == safety_event.id,
+                            NotificationOutbox.notification_type == "new",
+                            NotificationOutbox.status == "sent",
+                        )
+                    )
+                ).all()
+            )
+        original = next(
+            (
+                row for row in originals
+                if (row.payload_json or {}).get("route_id") == route.id
+                and (row.payload_json or {}).get("sent_message_id")
+            ),
+            None,
+        )
+        if original is None:
+            return False
+        ref = original.payload_json
+        text = safety_message(safety_event, self.settings.timezone)
+        try:
+            if ref.get("sent_as") == "caption":
+                await self.bot.edit_message_caption(
+                    chat_id=ref["sent_chat_id"],
+                    message_id=ref["sent_message_id"],
+                    caption=text,
+                    parse_mode="HTML",
+                )
+            else:
+                await self.bot.edit_message_text(
+                    chat_id=ref["sent_chat_id"],
+                    message_id=ref["sent_message_id"],
+                    text=text,
+                    parse_mode="HTML",
+                )
+        except TelegramBadRequest as exc:
+            if "not modified" not in str(exc).lower():
+                logger.warning(
+                    "safety_alert_edit_failed alert_id=%s error=%s",
+                    safety_event.alert_id,
+                    type(exc).__name__,
+                )
+                return False
+        except Exception as exc:
+            await self._fail(item_id, f"{type(exc).__name__}: {exc}")
+            return True
+        async with self.sessions.begin() as session:
+            row = await session.get(NotificationOutbox, item_id)
+            row.status, row.sent_at, row.last_error, row.processing_at = (
+                "sent",
+                datetime.now(UTC),
+                None,
+                None,
+            )
+            row.payload_json = {**(row.payload_json or {}), "edited_message_id": ref["sent_message_id"]}
+        logger.info("safety_alert_edited alert_id=%s", safety_event.alert_id)
+        return True
 
     async def _expand_routes(self, item_id: int) -> None:
         async with self.sessions.begin() as session:

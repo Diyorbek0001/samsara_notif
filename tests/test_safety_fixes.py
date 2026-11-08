@@ -276,3 +276,67 @@ def test_pick_still_uses_exact_safety_event_still_first() -> None:
     ]
     media, is_after = SafetyMonitor._pick_still(periodic + [exact], event)
     assert is_after and media == [exact]
+
+
+class FakeBot:
+    def __init__(self):
+        self.calls: list[tuple[str, dict]] = []
+
+    def _message(self, chat_id):
+        return SimpleNamespace(chat=SimpleNamespace(id=chat_id), message_id=len(self.calls) + 100)
+
+    async def send_message(self, **kwargs):
+        self.calls.append(("send_message", kwargs))
+        return self._message(kwargs["chat_id"])
+
+    async def edit_message_text(self, **kwargs):
+        self.calls.append(("edit_message_text", kwargs))
+
+    async def edit_message_caption(self, **kwargs):
+        self.calls.append(("edit_message_caption", kwargs))
+
+
+async def test_speed_update_edits_the_original_alert(tmp_path) -> None:
+    from cryptography.fernet import Fernet
+    from app.database.models import SamsaraAccount, TelegramRoute
+    from app.notifications.worker import OutboxWorker
+    from app.safety.service import process_safety_event, queue_speed_update
+
+    engine, sessions = create_database(f"sqlite+aiosqlite:///{tmp_path / 'edit.db'}")
+    await create_tables(engine)
+    now = datetime.now(UTC)
+    async with sessions.begin() as session:
+        account = SamsaraAccount(name="acb", encrypted_api_token="x", active=True, created_at=now, updated_at=now)
+        session.add(account)
+        await session.flush()
+        session.add(TelegramRoute(samsara_account_id=account.id, chat_id=-100, thread_id=None,
+                                  purpose="all", active=True, created_at=now, updated_at=now))
+        await session.flush()
+        parsed = parse_safety_event(_raw_event("e1"))
+        row, _ = await process_safety_event(session, parsed, initialization=False, send_initial=False,
+                                            timezone="America/New_York", integration_id=account.id,
+                                            notification_delay_seconds=0)
+        event_id = row.id
+
+    settings = Settings(token_encryption_key=Fernet.generate_key().decode())
+    bot = FakeBot()
+    worker = OutboxWorker(settings, sessions, bot)
+    assert await worker.send_pending_once() == 1
+    assert [c[0] for c in bot.calls] == ["send_message"]
+    original_id = 101  # FakeBot numbers messages from 101
+
+    async with sessions.begin() as session:
+        row = await session.get(SafetyEvent, event_id)
+        details = {"maxSpeedMph": 80.0, "postedSpeedLimitMph": 65.0, "overLimitMph": 15.0, "durationSeconds": 104}
+        row.raw_event_json = {**row.raw_event_json, "speedingDetails": details}
+        assert await queue_speed_update(session, row, details, 1)
+
+    await worker.send_pending_once()
+    kinds = [c[0] for c in bot.calls]
+    assert kinds == ["send_message", "edit_message_text"]
+    edit = bot.calls[1][1]
+    assert edit["message_id"] == original_id and edit["chat_id"] == -100
+    assert "Posted limit:</b> 65 mph" in edit["text"]
+    async with sessions() as session:
+        statuses = {r.notification_type: r.status for r in (await session.scalars(select(NotificationOutbox))).all()}
+    assert statuses == {"new": "sent", "speed_update": "sent"}
