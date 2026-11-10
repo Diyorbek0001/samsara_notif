@@ -64,6 +64,7 @@ class SafetyMonitor:
         self._stop = asyncio.Event()
         self._cycle_lock = asyncio.Lock()
         self._media_blocked_until: datetime | None = None
+        self._stills_blocked_until: datetime | None = None
         self._last_speed_recheck: datetime | None = None
         self._suffix = f":{integration_id}" if integration_id else ""
 
@@ -138,6 +139,9 @@ class SafetyMonitor:
             return parsed, False
         if any(item.get("url") for item in parsed.media):
             return parsed, True
+        if self._stills_blocked_until and datetime.now(UTC) < self._stills_blocked_until:
+            # No camera read access: don't hold the alert waiting for a photo.
+            return parsed, True
         key = f"safety_snapshot:{parsed.samsara_event_id}"
         async with self.sessions() as session:
             cached = await state_get(session, key)
@@ -163,6 +167,16 @@ class SafetyMonitor:
                         + SNAPSHOT_LOOKBACK,
                     ),
                 )
+            except (SamsaraAuthenticationError, SamsaraPermissionError):
+                self._stills_blocked_until = now + MEDIA_PERMISSION_BACKOFF
+                logger.warning(
+                    "camera_stills_unauthorized integration_id=%s "
+                    "hint=the Samsara API token needs Read Camera Media; "
+                    "obstructed camera alerts are sent without a photo paused_minutes=%d",
+                    self.integration_id,
+                    MEDIA_PERMISSION_BACKOFF.total_seconds() // 60,
+                )
+                return parsed, True
             except Exception:
                 logger.exception(
                     "safety_snapshot_lookup_failed event_id=%s", parsed.samsara_event_id

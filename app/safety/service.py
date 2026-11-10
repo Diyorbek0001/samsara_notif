@@ -120,18 +120,26 @@ async def queue_speed_update(
 ) -> bool:
     """Queue a follow-up alert when speeding details arrive after the first alert.
 
-    Only follow up on alerts that were actually delivered. If the first alert
+    Only follow up on alerts that were actually delivered (and recorded their
+    Telegram message). If the first alert
     is still pending it reads the new details at send time; if it was never
     sent (baseline, or no activated group) a follow-up would be confusing.
     """
-    sent_initial = await session.scalar(
-        select(NotificationOutbox.id).where(
-            NotificationOutbox.safety_event_id == row.id,
-            NotificationOutbox.notification_type == "new",
-            NotificationOutbox.status == "sent",
-        )
+    sent_initial = list(
+        (
+            await session.scalars(
+                select(NotificationOutbox).where(
+                    NotificationOutbox.safety_event_id == row.id,
+                    NotificationOutbox.notification_type == "new",
+                    NotificationOutbox.status == "sent",
+                )
+            )
+        ).all()
     )
-    if sent_initial is None:
+    # Only alerts sent by a version that records the Telegram message can be
+    # updated in place. Skipping older ones also prevents a burst of updates
+    # for the previous 12 hours right after an upgrade.
+    if not any((item.payload_json or {}).get("sent_message_id") for item in sent_initial):
         return False
     speed_signature = hashlib.sha256(str(details).encode()).hexdigest()[:20]
     idempotency_key = f"safety:speed:{row.samsara_event_id}:{speed_signature}"

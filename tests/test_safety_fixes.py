@@ -134,6 +134,7 @@ async def test_recheck_adds_posted_limit_after_trip_ends(tmp_path) -> None:
         assert row.raw_event_json["speedingDetails"].get("postedSpeedLimitMph") is None
         initial = await session.scalar(select(NotificationOutbox))
         initial.status = "sent"  # pretend the first alert went out
+        initial.payload_json = {**initial.payload_json, "sent_chat_id": -100, "sent_message_id": 5}
 
     # Trip ended: Samsara now has the speeding interval with the limit.
     client.speeding = {"maxSpeedMph": 76.0, "postedSpeedLimitMph": 65.0, "overLimitMph": 11.0}
@@ -507,3 +508,45 @@ async def test_migration_moves_routes_when_new_group_has_none(tmp_path) -> None:
     async with sessions() as session:
         route = await session.scalar(select(TelegramRoute))
     assert (route.chat_id, route.active) == (-1009, True)
+
+
+async def test_upgrade_does_not_backfill_alerts_sent_by_old_version(tmp_path) -> None:
+    client = FakeClient([[], [_raw_event("old")]])
+    client.speeding = {"maxSpeedMph": 76.0}
+    monitor, sessions = await _monitor(tmp_path, client)
+    await monitor.poll_once()
+    await monitor.poll_once()
+    async with sessions.begin() as session:
+        initial = await session.scalar(select(NotificationOutbox))
+        initial.status = "sent"  # sent by the old version: no stored message reference
+
+    client.speeding = {"maxSpeedMph": 76.0, "postedSpeedLimitMph": 65.0}
+    monitor._last_speed_recheck = None
+    from app.faults.service import state_set
+    async with sessions.begin() as session:
+        await state_set(session, "safety_speed_details:old", "")
+    await monitor.recheck_speed_limits()
+
+    async with sessions() as session:
+        types = [r.notification_type for r in (await session.scalars(select(NotificationOutbox))).all()]
+    assert types == ["new"]
+
+
+async def test_obstructed_alert_not_held_without_camera_read_access(tmp_path, caplog) -> None:
+    from app.samsara.exceptions import SamsaraPermissionError
+
+    class NoCameraClient(FakeClient):
+        async def get_camera_stills(self, vehicle_id, start_time, end_time):
+            self.still_calls += 1
+            raise SamsaraPermissionError("no camera scope")
+
+    client = NoCameraClient([[], [_raw_event("o1", label="ObstructedCamera"), _raw_event("o2", label="ObstructedCamera")]])
+    monitor, sessions = await _monitor(tmp_path, client)
+    await monitor.poll_once()
+    await monitor.poll_once()
+
+    async with sessions() as session:
+        due = [r.next_attempt_at.replace(tzinfo=UTC) for r in (await session.scalars(select(NotificationOutbox))).all()]
+    assert len(due) == 2 and all(d <= datetime.now(UTC) for d in due)  # sent now, not held 8 min
+    assert client.still_calls == 1  # paused after the first permission error
+    assert "camera_stills_unauthorized" in caplog.text
